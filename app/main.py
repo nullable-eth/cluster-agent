@@ -18,20 +18,21 @@ log = logging.getLogger("agent")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 E = os.environ.get
-LLM_URL   = E("LLM_URL", "http://qwen-coder.ai.svc.cluster.local:8001/v1")
-LLM_MODEL = E("LLM_MODEL", "qwen3.8-27b")
+CLUSTER   = E("CLUSTER_NAME", "the cluster")
+LLM_URL   = E("LLM_URL", "http://llm:8000/v1")   # any OpenAI-compatible server with tool calling
+LLM_MODEL = E("LLM_MODEL", "default")
 LLM_KEY   = E("LLM_API_KEY", "")
 MODE      = E("MODE", "propose")            # propose | auto
 DISCORD   = E("DISCORD_WEBHOOK", "")        # audit channel; optional
-HA_URL    = E("HA_URL", "http://192.168.1.50:8123")
+HA_URL    = E("HA_URL", "")                 # Home Assistant base URL; empty disables HA tools
 HA_TOKEN  = E("HA_TOKEN", "")
-MEM_URL   = E("MEMORY_URL", "http://agentmemory.ai.svc.cluster.local:8081")
+MEM_URL   = E("MEMORY_URL", "")             # agentmemory base URL; empty disables memory tool
 MEM_TOKEN = E("MEMORY_READ_TOKEN", "")
 MAX_STEPS = int(E("MAX_STEPS", "12"))
-CTX_BUDGET = int(E("CTX_BUDGET_TOKENS", "48000"))  # compact when prompt exceeds this; keeps V100 prefill fast, far under the 262k wall
+CTX_BUDGET = int(E("CTX_BUDGET_TOKENS", "48000"))  # compact when prompt exceeds; also a prefill-latency budget
 KEEP_FULL = int(E("KEEP_FULL_RESULTS", "4"))       # tool results older than this many messages get truncated to digests
 COOLDOWN  = int(E("COOLDOWN_S", "900"))
-PROTECTED = {p.strip() for p in E("PROTECTED", "cluster-agent,qwen-coder,qwen-voice").split(",") if p.strip()}
+PROTECTED = {p.strip() for p in E("PROTECTED", "cluster-agent").split(",") if p.strip()}
 
 # ------------------------------------------------------------------ kubectl
 READ_VERBS = {"get", "describe", "logs", "top", "events", "api-resources",
@@ -81,6 +82,8 @@ def run_kubectl(args: list[str]) -> str:
 
 # ------------------------------------------------------------------ HA / memory
 async def ha_get_states(entity_id: str = "") -> str:
+    if not HA_URL:
+        return "Home Assistant is not configured (HA_URL unset)"
     url = f"{HA_URL}/api/states" + (f"/{entity_id}" if entity_id else "")
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.get(url, headers={"Authorization": f"Bearer {HA_TOKEN}"})
@@ -88,6 +91,8 @@ async def ha_get_states(entity_id: str = "") -> str:
 
 
 async def ha_call_service(domain: str, service: str, entity_id: str = "", data: dict | None = None) -> str:
+    if not HA_URL:
+        return "Home Assistant is not configured (HA_URL unset)"
     if MODE != "auto":
         return f"PROPOSAL RECORDED (propose mode): ha {domain}.{service} on {entity_id or data}"
     body = dict(data or {})
@@ -100,6 +105,8 @@ async def ha_call_service(domain: str, service: str, entity_id: str = "", data: 
 
 
 async def search_memory(query: str, k: int = 6) -> str:
+    if not MEM_URL:
+        return "memory service is not configured (MEMORY_URL unset)"
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.get(f"{MEM_URL}/search", params={"q": query, "k": k},
@@ -150,7 +157,7 @@ TOOLS += [
             "required": ["summary"]}}},
 ]
 
-SYSTEM = f"""You are cluster-agent, the autonomous SRE for the Whitehorse k3s homelab.
+SYSTEM = f"""You are cluster-agent, the autonomous SRE for {CLUSTER} (Kubernetes, GitOps-managed).
 You are triggered by an alert. Diagnose it with tools, fix what policy allows, report via finish().
 
 Rules, in priority order:
