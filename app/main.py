@@ -29,6 +29,7 @@ HA_TOKEN  = E("HA_TOKEN", "")
 MEM_URL   = E("MEMORY_URL", "")             # agentmemory base URL; empty disables memory tool
 MEM_TOKEN = E("MEMORY_READ_TOKEN", "")
 MAX_STEPS = int(E("MAX_STEPS", "12"))
+MAX_TOKENS = int(E("LLM_MAX_TOKENS", "4000"))  # headroom for reasoning + tool JSON; truncation mid-arguments = server 500
 CTX_BUDGET = int(E("CTX_BUDGET_TOKENS", "48000"))  # compact when prompt exceeds; also a prefill-latency budget
 KEEP_FULL = int(E("KEEP_FULL_RESULTS", "4"))       # tool results older than this many messages get truncated to digests
 COOLDOWN  = int(E("COOLDOWN_S", "900"))
@@ -175,18 +176,34 @@ Rules, in priority order:
 
 # ------------------------------------------------------------------ agent loop
 async def call_llm(messages: list[dict], tools: list | None = None) -> tuple[dict, int]:
-    """Returns (assistant message, prompt_tokens used) so the loop can manage context."""
-    async with httpx.AsyncClient(timeout=300) as c:
-        r = await c.post(f"{LLM_URL}/chat/completions",
-                         headers={"Authorization": f"Bearer {LLM_KEY}"},
-                         json={"model": LLM_MODEL, "messages": messages,
-                               "tools": tools if tools is not None else TOOLS,
-                               "max_tokens": 2000})
-    r.raise_for_status()
-    body = r.json()
-    used = int(body.get("usage", {}).get("prompt_tokens")
-               or sum(len(json.dumps(m)) for m in messages) // 4)  # estimate fallback
-    return body["choices"][0]["message"], used
+    """Returns (assistant message, prompt_tokens used) so the loop can manage context.
+    Retries 5xx twice: local servers 500 on malformed sampled tool-JSON; a fresh
+    sample almost always parses."""
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=300) as c:
+                r = await c.post(f"{LLM_URL}/chat/completions",
+                                 headers={"Authorization": f"Bearer {LLM_KEY}"},
+                                 json={"model": LLM_MODEL, "messages": messages,
+                                       "tools": tools if tools is not None else TOOLS,
+                                       "max_tokens": MAX_TOKENS})
+            r.raise_for_status()
+            body = r.json()
+            used = int(body.get("usage", {}).get("prompt_tokens")
+                       or sum(len(json.dumps(m)) for m in messages) // 4)  # estimate fallback
+            return body["choices"][0]["message"], used
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            if exc.response.status_code < 500:
+                raise
+            log.warning("LLM %s (attempt %d/3) — retrying", exc.response.status_code, attempt + 1)
+            await asyncio.sleep(3 * (attempt + 1))
+        except httpx.TransportError as exc:
+            last_exc = exc
+            log.warning("LLM transport error (attempt %d/3): %s — retrying", attempt + 1, exc)
+            await asyncio.sleep(5 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
 
 
 def trim_old_results(messages: list[dict]) -> None:
