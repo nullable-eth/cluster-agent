@@ -138,6 +138,28 @@ INCIDENTS: dict[str, Incident] = {}
 BY_THREAD: dict[str, Incident] = {}
 SELF_ID: str | None = None
 
+THREAD_SEP = " · "
+
+
+def incident_key(payload: dict) -> str:
+    """alertname + namespace, not Alertmanager's groupKey.
+
+    The groupKey is opaque and lives only in this process's memory, so after a
+    restart a RESOLVED for an incident we were working on matched nothing and
+    fell out of its thread into the channel. This key is derivable from two
+    places instead of one: the alert payload, and the thread title we wrote
+    ("alertname · namespace"). That makes re-adoption complete — a restart
+    rejoins the thread AND remembers which alert it belongs to.
+
+    Alertmanager groups by exactly these two labels here, so this is the same
+    grouping, just spelled in something both sides can reconstruct.
+    """
+    gl = payload.get("groupLabels") or {}
+    name = gl.get("alertname")
+    if not name:
+        return payload.get("groupKey") or json.dumps(gl, sort_keys=True)
+    return f"{name}{THREAD_SEP}{gl.get('namespace', '')}".strip()
+
 
 def presence_text() -> str:
     """What the member list says the bot is doing, so "up" is legible at a glance."""
@@ -172,7 +194,7 @@ async def investigate(inc: Incident, first: bool) -> None:
 
 
 async def handle_alert(payload: dict) -> None:
-    key = payload.get("groupKey") or json.dumps(payload.get("groupLabels", {}), sort_keys=True)
+    key = incident_key(payload)
     labels = payload.get("groupLabels", {}) or {}
     name = labels.get("alertname", "unknown-alert")
     inc = INCIDENTS.get(key)
@@ -185,7 +207,9 @@ async def handle_alert(payload: dict) -> None:
             # is the invariant, and the message is also the thread's anchor.
             mid = await discord.find_alert_message(name, labels, time.time())
             if mid:
-                thread = await discord.open_thread(mid, f"{name} · {labels.get('namespace', '')}".strip(" ·"))
+                # The title IS the key (see incident_key): a restart reads it
+                # back and knows which alert this thread belongs to.
+                thread = await discord.open_thread(mid, key)
             else:
                 log.warning("no Alertmanager message found for %s; reporting in-channel", name)
         inc = Incident(key, name, thread)
@@ -302,7 +326,12 @@ async def _start() -> None:
         # Re-adopt the threads we were already in, so a restart does not strand
         # a conversation mid-incident. Their history is gone; the thread is not.
         for t in await discord.active_threads():
-            inc = Incident(f"adopted:{t['id']}", t.get("name", "incident"), t["id"])
+            # The thread title is the incident key, so adoption restores routing
+            # as well as the conversation: a RESOLVED arriving after a restart
+            # lands in its own thread instead of loose in the channel.
+            key = (t.get("name") or "").strip()
+            inc = Incident(key or f"adopted:{t['id']}",
+                           key.split(THREAD_SEP)[0] or "incident", t["id"])
             inc.messages = [{"role": "system", "content": SYSTEM},
                             {"role": "user", "content":
                              f"You are resuming an incident thread titled {t.get('name')!r} after a "
@@ -330,17 +359,17 @@ async def healthz() -> dict:
 async def alert(req: Request) -> dict:
     payload = await req.json()
     status = payload.get("status", "firing")
-    key = payload.get("groupKey") or json.dumps(payload.get("groupLabels", {}), sort_keys=True)
+    key = incident_key(payload)
     name = (payload.get("groupLabels") or {}).get("alertname", "unknown-alert")
     inc = INCIDENTS.get(key)
     now = time.time()
 
     if status == "resolved":
-        # Prometheus closing the loop, in the same thread as everything else —
-        # or in the channel when there is no thread to close, which happens
-        # after a restart: the thread is re-adopted but its alert group is not,
-        # so this resolve has nowhere better to go. Saying it in the channel
-        # beats saying nothing, which is what a dropped resolve looks like.
+        # Prometheus closing the loop, in the same thread as everything else.
+        # Falls back to the channel only when there is genuinely no thread —
+        # the alert message was never found, or this resolve is for something
+        # that fired before the agent existed. Saying it in the channel beats
+        # saying nothing, which is what a dropped resolve looks like.
         await say(inc, f"✅ **Resolved** — Prometheus says {name} has cleared."
                   if not inc else "✅ **Resolved** — Prometheus says this alert has cleared.")
         if inc:
