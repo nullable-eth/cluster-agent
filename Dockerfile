@@ -1,12 +1,9 @@
-# cluster-agent — alert-triggered autonomous reconciler (docs: README.md)
+# cluster-agent — alert-triggered reconciler that argues back (docs: README.md)
 FROM python:3.13-slim
 
-# kubectl — pinned, verified. Matches cluster minor or +/-1 per skew policy.
-ARG KUBECTL_VERSION=v1.33.4
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
- && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
- && chmod +x /usr/local/bin/kubectl \
- && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+# No kubectl. This process stopped making Kubernetes API calls when the tool
+# surface moved to llm-gateway, and an image that carries a cluster CLI it never
+# invokes is a 50MB invitation.
 
 WORKDIR /srv
 COPY requirements.txt .

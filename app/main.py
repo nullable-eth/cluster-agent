@@ -18,7 +18,7 @@ import asyncio, json, logging, os, time
 import httpx
 from fastapi import FastAPI, Request
 
-from . import discord
+from . import discord, gateway
 
 log = logging.getLogger("agent")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -124,6 +124,10 @@ class Incident:
         self.last_seen: str | None = None
         self.ran_at: float = 0.0
         self.lock = asyncio.Lock()
+        # Replies arrive twice by design — once down the socket, once from the
+        # poller that exists in case the socket is lying. Idempotence is what
+        # lets both run without coordinating.
+        self.seen: set[str] = set()
 
     def trim(self) -> list[dict]:
         head, tail = self.messages[:2], self.messages[2:]
@@ -133,6 +137,12 @@ class Incident:
 INCIDENTS: dict[str, Incident] = {}
 BY_THREAD: dict[str, Incident] = {}
 SELF_ID: str | None = None
+
+
+def presence_text() -> str:
+    """What the member list says the bot is doing, so "up" is legible at a glance."""
+    n = len(BY_THREAD)
+    return "the cluster" if not n else f"{n} incident thread{'' if n == 1 else 's'}"
 
 
 async def say(inc: Incident | None, text: str) -> None:
@@ -185,6 +195,7 @@ async def handle_alert(payload: dict) -> None:
         INCIDENTS[key] = inc
         if thread:
             BY_THREAD[thread] = inc
+            await gateway.set_presence(presence_text())
         if not thread:
             await say(inc, f"**[cluster-agent] {name}** — could not find the alert message to "
                            f"thread on, so this is in-channel.")
@@ -197,16 +208,57 @@ async def handle_alert(payload: dict) -> None:
     await investigate(inc, first=True)
 
 
-# ------------------------------------------------------------ reply poller
-async def poll_replies() -> None:
-    """The operator's half of the conversation, every POLL_S seconds.
+# --------------------------------------------------- the operator's replies
+def ingest(inc: Incident, msgs: list[dict]) -> bool:
+    """Take operator messages into the conversation. Idempotent, by message id."""
+    fresh = [m for m in msgs if m["id"] not in inc.seen and (m.get("content") or "").strip()]
+    if not fresh:
+        return False
+    for m in fresh:
+        inc.seen.add(m["id"])
+    if len(inc.seen) > 500:
+        inc.seen = set(list(inc.seen)[-250:])
+    # Snowflakes sort chronologically as integers, and `after=` needs the
+    # highest one we have seen — the socket and the poller can hand them over in
+    # either order. Anything unparseable is treated as newer rather than
+    # crashing the reply path over an id format.
+    last = fresh[-1]["id"]
+    try:
+        newer = inc.last_seen is None or int(last) > int(inc.last_seen)
+    except (TypeError, ValueError):
+        newer = True
+    if newer:
+        inc.last_seen = last
+    text = "\n".join(f"{m['author']}: {m['content']}" for m in fresh)
+    log.info("operator replied in %s (%s): %s", inc.name, inc.thread, text[:120])
+    inc.messages.append({"role": "user", "content": text})
+    return True
 
-    Polling rather than a gateway socket: nothing to keep alive, nothing to
-    reconnect, and a 15-second delay on a reply is not a cost anyone feels at
-    3am. The websocket buys instant delivery and costs a daemon.
+
+async def on_gateway_message(d: dict) -> None:
+    """A message arrived on the socket. Only thread replies from people matter."""
+    inc = BY_THREAD.get(str(d.get("channel_id") or ""))
+    if not inc:
+        return
+    author = d.get("author") or {}
+    if d.get("webhook_id") or author.get("bot") or author.get("id") == SELF_ID:
+        return
+    if ingest(inc, [{"id": d["id"], "author": author.get("username", "?"),
+                     "content": (d.get("content") or "").strip()}]):
+        asyncio.create_task(investigate(inc, first=False))
+
+
+async def poll_replies() -> None:
+    """The safety net under the socket.
+
+    The socket delivers replies instantly and carries the presence that makes
+    the bot show as online. This exists because a websocket can fail in ways
+    that look exactly like silence, and silence is indistinguishable from "the
+    operator had nothing to add". While the socket is up this is a slow
+    background sweep; when it is down it is the whole reply path.
     """
     while True:
-        await asyncio.sleep(POLL_S)
+        await asyncio.sleep(POLL_S * 4 if gateway.connected() else POLL_S)
         if not discord.enabled() or not SELF_ID:
             continue
         for inc in list(BY_THREAD.values()):
@@ -217,15 +269,8 @@ async def poll_replies() -> None:
             except Exception as exc:
                 log.warning("poll failed on %s: %s", inc.thread, exc)
                 continue
-            if not msgs:
-                continue
-            inc.last_seen = msgs[-1]["id"]
-            text = "\n".join(f"{m['author']}: {m['content']}" for m in msgs if m["content"])
-            if not text.strip():
-                continue
-            log.info("operator replied in %s (%s): %s", inc.name, inc.thread, text[:120])
-            inc.messages.append({"role": "user", "content": text})
-            asyncio.create_task(investigate(inc, first=False))
+            if msgs and ingest(inc, msgs):
+                asyncio.create_task(investigate(inc, first=False))
 
 
 # ------------------------------------------------------------------ service
@@ -267,13 +312,18 @@ async def _start() -> None:
             INCIDENTS[inc.key] = inc
             BY_THREAD[t["id"]] = inc
         log.info("adopted %d open thread(s)", len(BY_THREAD))
+        # The socket: replies land instantly, and the bot shows as online in the
+        # member list — which is the only way to tell "watching" from "dead",
+        # since both look like an empty channel.
+        asyncio.create_task(gateway.run(discord.TOKEN, on_gateway_message, presence_text))
     log.info("cluster-agent up: mode=%s llm=%s discord=%s poll=%ds timeout=%ds backoff=%s",
              MODE, LLM_URL, "on" if discord.enabled() else "off", POLL_S, LLM_TIMEOUT_S, BRAIN_BACKOFF)
 
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"ok": True, "mode": MODE, "queued": QUEUE.qsize(), "threads": len(BY_THREAD)}
+    return {"ok": True, "mode": MODE, "queued": QUEUE.qsize(), "threads": len(BY_THREAD),
+            "discord": gateway.status()}
 
 
 @app.post("/alert")
