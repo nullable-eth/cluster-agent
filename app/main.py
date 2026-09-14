@@ -336,9 +336,14 @@ async def alert(req: Request) -> dict:
     now = time.time()
 
     if status == "resolved":
-        # Prometheus closing the loop, in the same thread as everything else.
+        # Prometheus closing the loop, in the same thread as everything else —
+        # or in the channel when there is no thread to close, which happens
+        # after a restart: the thread is re-adopted but its alert group is not,
+        # so this resolve has nowhere better to go. Saying it in the channel
+        # beats saying nothing, which is what a dropped resolve looks like.
+        await say(inc, f"✅ **Resolved** — Prometheus says {name} has cleared."
+                  if not inc else "✅ **Resolved** — Prometheus says this alert has cleared.")
         if inc:
-            await say(inc, "✅ **Resolved** — Prometheus says this alert has cleared.")
             inc.ran_at = 0.0
         return {"queued": False, "reason": "resolved"}
 
