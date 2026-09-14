@@ -114,7 +114,12 @@ async def ask(payload: dict) -> str:
             raise
         except httpx.HTTPStatusError as exc:
             last_exc = exc
-            if exc.response.status_code not in (500, 502, 503, 504):
+            # 502/503 only: the gateway says its upstream is not answering, which
+            # is a model rollout. 504 is the gateway's OWN deadline — it is there
+            # and still thinking — and retrying that starts a second identical
+            # loop competing with the first for the same slots. 500 is a loop
+            # that failed, which will fail again.
+            if exc.response.status_code not in (502, 503):
                 raise
             if attempt >= len(BRAIN_BACKOFF):
                 break
