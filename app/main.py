@@ -56,11 +56,24 @@ reading, so write like a colleague reporting in — short, specific, no ceremony
    silence_alert with their words and the hit you found them in, then finish() saying what you
    silenced, for how long, and on whose instruction.
 3. Otherwise diagnose from evidence — pod status, events, logs — before concluding anything.
-4. You may act to restore service, and every action you take is posted in this thread as it
-   happens. Flux reverts direct writes within 30 minutes, so a write buys time NOW; anything meant
-   to stick is a git change you describe instead.
-5. Mode is '{MODE}'. Mutations outside what policy allows are recorded as proposals, not run.
-6. End with finish(). Say plainly what you could not determine.
+4. Never treat live config as intended just because it is what is running. This cluster is
+   GitOps-managed: the HelmRelease or Kustomization that OWNS a workload holds the desired state,
+   and the live object can have drifted from it. Before you blame any value — a host, an IP, a
+   claim name, an image — read what its owner declares
+   (kubectl get hr <name> -n <ns> -o jsonpath='{{.spec.values}}') and compare it with the live
+   object. Check too whether Flux has been stopped on it: spec.suspend, and whether the last
+   reconcile failed. A value that appears nowhere in the declared spec is DRIFT — the drift is the
+   fault, and explaining why the drifted value cannot work is not a diagnosis.
+5. Match the repair to the cause. Getting this wrong is how an outage stays an outage:
+   - Live has drifted from what Flux declares -> hand it back to Flux. Clear spec.suspend if it is
+     set, then force a reconcile (annotate with reconcile.fluxcd.io/requestedAt and forceAt, both
+     set to now). Flux rewrites the live object from git. This is the DURABLE fix, not a stopgap,
+     and it needs no git change because git is already correct.
+   - Live matches Flux and the declared state is itself wrong -> that is a git change. Describe it.
+   - Nothing drifted, something is just wedged (a stuck pod, a stale mount) -> a direct write buys
+     time NOW, and Flux reverts it within 30 minutes, so say what still needs doing.
+6. Mode is '{MODE}'. Mutations outside what policy allows are recorded as proposals, not run.
+7. End with finish(). Say plainly what you could not determine.
 
 When the operator replies in the thread, they are talking to you: do what they ask, or say why not.
 Their instruction outranks your diagnosis — if they say a state is expected, it is expected.
@@ -272,6 +285,21 @@ async def on_gateway_message(d: dict) -> None:
         asyncio.create_task(investigate(inc, first=False))
 
 
+def forget(inc: Incident) -> None:
+    """Stop tracking an incident whose thread no longer exists.
+
+    Both registries, or the incident comes straight back: poll_replies walks
+    BY_THREAD, and a repeat firing of the same alert would re-adopt the dead
+    thread out of INCIDENTS. If that alert fires again it gets a new message
+    and a new thread, which is the right outcome — the old one is unreadable.
+    """
+    if inc.thread:
+        BY_THREAD.pop(inc.thread, None)
+    if INCIDENTS.get(inc.key) is inc:
+        INCIDENTS.pop(inc.key, None)
+    log.info("thread %s for %s is gone; stopped watching it", inc.thread, inc.name)
+
+
 async def poll_replies() -> None:
     """The safety net under the socket.
 
@@ -290,6 +318,12 @@ async def poll_replies() -> None:
                 continue                     # busy investigating; read it next tick
             try:
                 msgs = await discord.new_messages(inc.thread, inc.last_seen, SELF_ID)
+            except discord.ThreadGone:
+                # Deleted thread, or the channel was cleared under us. Nothing
+                # will ever be said here again, so stop watching it — otherwise
+                # this id is polled every tick until the process dies.
+                forget(inc)
+                continue
             except Exception as exc:
                 log.warning("poll failed on %s: %s", inc.thread, exc)
                 continue

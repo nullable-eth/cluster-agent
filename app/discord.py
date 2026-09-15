@@ -133,13 +133,30 @@ async def me() -> str | None:
     return (body or {}).get("id") if s == 200 else None
 
 
+class ThreadGone(Exception):
+    """The thread no longer exists — deleted, or its channel was cleared.
+
+    Distinct from "nothing new was said", which is an empty list. A deleted
+    thread used to be indistinguishable from a quiet one: 404 returned [], the
+    incident stayed in the poll set, and the agent re-polled a dead id every
+    tick for the life of the process. Clearing the channel left one such loop
+    running for days, burning Discord's rate limit on a thread nobody could
+    read.
+    """
+
+
 async def new_messages(thread_id: str, after: str | None, self_id: str) -> list[dict]:
-    """Human messages in a thread since `after`, oldest first."""
+    """Human messages in a thread since `after`, oldest first.
+
+    Raises ThreadGone if the thread has been deleted, so the caller can stop
+    watching it rather than polling forever.
+    """
     q = f"/channels/{thread_id}/messages?limit=20" + (f"&after={after}" if after else "")
     s, msgs = await call("GET", q)
+    if s == 404:
+        raise ThreadGone(thread_id)
     if s != 200 or not isinstance(msgs, list):
-        if s not in (200, 404):
-            log.warning("thread poll failed %s on %s", s, thread_id)
+        log.warning("thread poll failed %s on %s", s, thread_id)
         return []
     out = []
     for m in reversed(msgs):                      # Discord returns newest first
