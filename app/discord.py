@@ -173,6 +173,48 @@ async def new_messages(thread_id: str, after: str | None, self_id: str) -> list[
     return out
 
 
+async def channel(channel_id: str) -> dict | None:
+    """One channel/thread, or None if it is gone. 404 here means deleted."""
+    s, body = await call("GET", f"/channels/{channel_id}")
+    if s == 404:
+        raise ThreadGone(channel_id)
+    return body if s == 200 else None
+
+
+async def history(thread_id: str, limit: int = 60) -> list[dict]:
+    """A thread's messages, oldest first, EVERYONE's — including our own.
+
+    new_messages() deliberately filters down to human replies since a marker;
+    this is the opposite job. Rebuilding an incident days later means replaying
+    what was actually said, both halves of it, which is the only record of that
+    investigation once the process that ran it is long gone.
+    """
+    s, msgs = await call("GET", f"/channels/{thread_id}/messages?limit={min(limit, 100)}")
+    if s == 404:
+        raise ThreadGone(thread_id)
+    if s != 200 or not isinstance(msgs, list):
+        return []
+    out = []
+    for m in reversed(msgs):                      # Discord returns newest first
+        text = (m.get("content") or "").strip()
+        if not text:
+            continue
+        a = m.get("author") or {}
+        out.append({"id": m["id"],
+                    "author": a.get("username", "?"),
+                    "mine": bool(a.get("id") and a.get("id") == _SELF.get("id")),
+                    "bot": bool(a.get("bot") or m.get("webhook_id")),
+                    "content": text})
+    return out
+
+
+_SELF: dict = {}          # filled by remember_self(), so history() can tell our own voice
+
+
+def remember_self(user_id: str) -> None:
+    _SELF["id"] = user_id
+
+
 async def archive_thread(thread_id: str) -> None:
     """Close a thread out when its incident resolves.
 

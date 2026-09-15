@@ -13,7 +13,7 @@ LLM_URL; what lives here is the conversation: take the webhook, find the
 message, hold the thread, and make sure every alert ends with either a report
 or an explanation of why there isn't one.
 """
-import asyncio, json, logging, os, time
+import asyncio, hashlib, json, logging, os, time
 
 import httpx
 from fastapi import FastAPI, Request
@@ -152,6 +152,9 @@ class Incident:
     """One alert group: its thread, its conversation, where we read up to."""
     def __init__(self, key: str, name: str, thread: str | None):
         self.key, self.name, self.thread = key, name, thread
+        # Short id for THIS firing, carried in the thread title and the prompt
+        # so one outage can be told from the next and quoted back later.
+        self.sha: str = ""
         self.messages: list[dict] = []
         self.last_seen: str | None = None
         self.ran_at: float = 0.0
@@ -159,6 +162,10 @@ class Incident:
         # at that point so the next firing anchors its own thread, but stays
         # watched for replies until the watched set needs the room.
         self.resolved: bool = False
+        # False for a thread adopted at startup: we hold the routing but not
+        # the conversation, so the first reply pulls the history back out of
+        # Discord instead of answering "I don't have the earlier thread".
+        self.hydrated: bool = True
         self.lock = asyncio.Lock()
         # Replies arrive twice by design — once down the socket, once from the
         # poller that exists in case the socket is lying. Idempotence is what
@@ -204,6 +211,34 @@ def incident_key(payload: dict) -> str:
     return THREAD_SEP.join([name] + rest)[:100].strip()
 
 
+def incident_sha(payload: dict) -> str:
+    """A short, stable id for ONE firing episode.
+
+    Needed because thread titles stopped being unique the moment each firing
+    got its own thread: two outages of the same alert are both
+    "ProbeFailed · monitoring". The sha distinguishes them, in the title, in
+    the prompt the model is given, and in what the operator quotes back.
+
+    Seeded from the group plus the EARLIEST startsAt in the payload, so every
+    re-fire inside one episode hashes the same while a genuinely new outage
+    hashes differently.
+    """
+    starts = sorted((a.get("startsAt") or "") for a in (payload.get("alerts") or []))
+    seed = f"{payload.get('groupKey') or incident_key(payload)}|{starts[0] if starts else ''}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:8]
+
+
+def thread_title(key: str, sha: str) -> str:
+    """Title IS the identity: the key to re-adopt by, plus the sha to tell
+    one firing from the next. Discord caps thread names at 100 characters."""
+    return f"{key[:100 - len(sha) - len(THREAD_SEP)]}{THREAD_SEP}{sha}"
+
+
+def sha_from_title(title: str) -> str:
+    tail = (title or "").split(THREAD_SEP)[-1].strip()
+    return tail if len(tail) == 8 and all(c in "0123456789abcdef" for c in tail) else ""
+
+
 def presence_text() -> str:
     """What the member list says the bot is doing, so "up" is legible at a glance."""
     n = len(BY_THREAD)
@@ -231,9 +266,9 @@ async def investigate(inc: Incident, first: bool) -> None:
     """
     async with inc.lock:
         t0 = time.monotonic()
-        await say(inc, f"⏳ **On it** — handed to the model, up to ~{LLM_TIMEOUT_S // 60} min "
-                       f"of tool work. Actions appear here as they happen, and a report "
-                       f"lands here either way.")
+        await say(inc, f"⏳ **On it** — `{inc.sha or '········'}` handed to the model, up to "
+                       f"~{LLM_TIMEOUT_S // 60} min of tool work. Actions appear here as they "
+                       f"happen, and a report lands here either way.")
         try:
             report = await ask(inc.trim(), inc.thread)
         except Exception as exc:
@@ -258,6 +293,7 @@ async def investigate(inc: Incident, first: bool) -> None:
 
 async def handle_alert(payload: dict) -> None:
     key = incident_key(payload)
+    sha = incident_sha(payload)
     labels = payload.get("groupLabels", {}) or {}
     name = labels.get("alertname", "unknown-alert")
     inc = INCIDENTS.get(key)
@@ -272,12 +308,14 @@ async def handle_alert(payload: dict) -> None:
             if mid:
                 # The title IS the key (see incident_key): a restart reads it
                 # back and knows which alert this thread belongs to.
-                thread = await discord.open_thread(mid, key)
+                thread = await discord.open_thread(mid, thread_title(key, sha))
             else:
                 log.warning("no Alertmanager message found for %s; reporting in-channel", name)
         inc = Incident(key, name, thread)
+        inc.sha = sha
         inc.messages = [{"role": "system", "content": SYSTEM},
                         {"role": "user", "content":
+                         f"Incident {sha} ({key}).\n"
                          "Alertmanager payload:\n" + json.dumps(payload, indent=1)[:6000]}]
         INCIDENTS[key] = inc
         if thread:
@@ -328,13 +366,79 @@ def ingest(inc: Incident, msgs: list[dict]) -> bool:
     return True
 
 
+async def rehydrate(thread_id: str) -> Incident | None:
+    """Rebuild an incident from the thread itself.
+
+    Discord IS the durable store. Nothing about an incident is written to a
+    database, and the process that investigated it may have been replaced
+    weeks ago — but the thread still holds the whole exchange, so a question
+    asked two days later can be answered with the same context the original
+    run had. Cheaper and far less to go wrong than persisting transcripts, and
+    it cannot drift from what the operator is actually reading.
+
+    Returns None for anything that is not one of our incident threads. Raises
+    ThreadGone if it has been deleted, which is the caller's cue to forget it.
+    """
+    ch = await discord.channel(thread_id)                    # ThreadGone if deleted
+    if not ch or ch.get("parent_id") != discord.CHANNEL:
+        return None                                          # not ours; ignore
+    title = ch.get("name") or ""
+    key = title.rsplit(THREAD_SEP, 1)[0] if sha_from_title(title) else title
+    inc = Incident(key, key.split(THREAD_SEP)[0] or "incident", thread_id)
+    inc.sha = sha_from_title(title)
+    inc.resolved = bool((ch.get("thread_metadata") or {}).get("archived"))
+
+    msgs = await discord.history(thread_id)
+    convo: list[dict] = []
+    for m in msgs:
+        role = "assistant" if m["mine"] else "user"
+        who = "" if m["mine"] else f"{m['author']}: "
+        convo.append({"role": role, "content": f"{who}{m['content']}"[:4000]})
+        inc.seen.add(m["id"])
+        inc.last_seen = m["id"]
+    inc.messages = [{"role": "system", "content": SYSTEM},
+                    {"role": "user", "content":
+                     f"Incident {inc.sha or '(no id)'} ({key}). This thread is being picked up "
+                     f"again later; what follows is the record of it so far."}] + convo
+    BY_THREAD[thread_id] = inc
+    if not inc.resolved:
+        INCIDENTS.setdefault(key, inc)
+    log.info("rehydrated %s (%s) from %d thread message(s)", key, inc.sha or "-", len(msgs))
+    return inc
+
+
 async def on_gateway_message(d: dict) -> None:
     """A message arrived on the socket. Only thread replies from people matter."""
-    inc = BY_THREAD.get(str(d.get("channel_id") or ""))
-    if not inc:
-        return
     author = d.get("author") or {}
     if d.get("webhook_id") or author.get("bot") or author.get("id") == SELF_ID:
+        return                                   # cheap checks BEFORE any API call
+    cid = str(d.get("channel_id") or "")
+    if not cid or cid == discord.CHANNEL:
+        return
+    inc, rebuilt = BY_THREAD.get(cid), None
+    if inc is None or not inc.hydrated:
+        # Either a thread nobody is watching any more — resolved and aged out,
+        # or from before a restart — or one adopted for routing with no
+        # conversation behind it. Read it back out of Discord rather than
+        # ignoring the question or answering without the context.
+        try:
+            rebuilt = await rehydrate(cid)
+        except discord.ThreadGone:
+            if inc is not None:
+                forget(inc)
+            return
+        inc = rebuilt or inc
+        if inc is None:
+            return
+    if rebuilt is not None:
+        # The message that triggered this is already part of the rebuilt
+        # history, and rehydrate marked it seen — so ingest would suppress the
+        # very question being asked. Only ingest if Discord had not caught up
+        # yet, then answer either way.
+        if d["id"] not in inc.seen:
+            ingest(inc, [{"id": d["id"], "author": author.get("username", "?"),
+                          "content": (d.get("content") or "").strip()}])
+        asyncio.create_task(investigate(inc, first=False))
         return
     if ingest(inc, [{"id": d["id"], "author": author.get("username", "?"),
                      "content": (d.get("content") or "").strip()}]):
@@ -434,21 +538,27 @@ async def _start() -> None:
     asyncio.create_task(poll_replies())
     if discord.enabled():
         SELF_ID = await discord.me()
+        if SELF_ID:
+            discord.remember_self(SELF_ID)   # lets history() tell our voice from theirs
         # Re-adopt the threads we were already in, so a restart does not strand
         # a conversation mid-incident. Their history is gone; the thread is not.
         for t in await discord.active_threads():
-            # The thread title is the incident key, so adoption restores routing
-            # as well as the conversation: a RESOLVED arriving after a restart
-            # lands in its own thread instead of loose in the channel.
-            key = (t.get("name") or "").strip()
+            # The thread title is the incident key plus this firing's sha, so
+            # adoption restores routing as well as the conversation: a RESOLVED
+            # arriving after a restart lands in its own thread instead of loose
+            # in the channel. The sha is stripped back off to recover the key.
+            title = (t.get("name") or "").strip()
+            sha = sha_from_title(title)
+            key = title.rsplit(THREAD_SEP, 1)[0] if sha else title
             inc = Incident(key or f"adopted:{t['id']}",
                            key.split(THREAD_SEP)[0] or "incident", t["id"])
-            inc.messages = [{"role": "system", "content": SYSTEM},
-                            {"role": "user", "content":
-                             f"You are resuming an incident thread titled {t.get('name')!r} after a "
-                             f"restart. You do not have the earlier conversation; if the operator "
-                             f"asks something that depends on it, say so and re-establish from the "
-                             f"cluster."}]
+            inc.sha = sha
+            # Routing only. The conversation is left empty and hydrated=False:
+            # the first reply reads the thread back out of Discord, so a
+            # question after a restart is answered with the real history rather
+            # than an apology for not having it.
+            inc.hydrated = False
+            inc.messages = [{"role": "system", "content": SYSTEM}]
             INCIDENTS[inc.key] = inc
             BY_THREAD[t["id"]] = inc
         log.info("adopted %d open thread(s)", len(BY_THREAD))
