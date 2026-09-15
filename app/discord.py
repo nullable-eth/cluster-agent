@@ -173,6 +173,19 @@ async def new_messages(thread_id: str, after: str | None, self_id: str) -> list[
     return out
 
 
+async def archive_thread(thread_id: str) -> None:
+    """Close a thread out when its incident resolves.
+
+    Two jobs. It reads as finished in the client, and it drops out of the
+    guild's ACTIVE thread list — so a restart does not re-adopt a thread whose
+    incident is over and start appending the next outage to it. Posting to an
+    archived thread reopens it (see post), so an operator reply still works.
+    """
+    s, _ = await call("PATCH", f"/channels/{thread_id}", {"archived": True})
+    if s >= 300:
+        log.warning("could not archive thread %s: %s", thread_id, s)
+
+
 async def active_threads() -> list[dict]:
     """Threads already open on our channel, so a restart rejoins its incidents."""
     s, ch = await call("GET", f"/channels/{CHANNEL}")

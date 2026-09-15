@@ -155,6 +155,10 @@ class Incident:
         self.messages: list[dict] = []
         self.last_seen: str | None = None
         self.ran_at: float = 0.0
+        # Set when Prometheus sends the RESOLVED. The incident leaves INCIDENTS
+        # at that point so the next firing anchors its own thread, but stays
+        # watched for replies until the watched set needs the room.
+        self.resolved: bool = False
         self.lock = asyncio.Lock()
         # Replies arrive twice by design — once down the socket, once from the
         # poller that exists in case the socket is lying. Idempotence is what
@@ -337,6 +341,27 @@ async def on_gateway_message(d: dict) -> None:
         asyncio.create_task(investigate(inc, first=False))
 
 
+WATCH_MAX = int(E("WATCH_MAX_THREADS", "25"))
+
+
+def retire_watched() -> None:
+    """Keep watching resolved threads for replies, but not without limit.
+
+    A resolved incident leaves INCIDENTS (so the next firing gets its own
+    thread) yet stays in BY_THREAD, because an operator may well come back and
+    ask about it afterwards. That set would otherwise grow for the life of the
+    process, so the oldest resolved ones are dropped once it gets long. Live
+    incidents are never dropped.
+    """
+    while len(BY_THREAD) > WATCH_MAX:
+        for tid, inc in BY_THREAD.items():          # insertion-ordered: oldest first
+            if inc.resolved:
+                BY_THREAD.pop(tid, None)
+                break
+        else:
+            return                                   # nothing resolved left to drop
+
+
 def forget(inc: Incident) -> None:
     """Stop tracking an incident whose thread no longer exists.
 
@@ -460,6 +485,17 @@ async def alert(req: Request) -> dict:
                   if not inc else "✅ **Resolved** — Prometheus says this alert has cleared.")
         if inc:
             inc.ran_at = 0.0
+            inc.resolved = True
+            # RETIRE the incident. It used to live in INCIDENTS forever, so
+            # every later firing of the same alert was appended to the FIRST
+            # thread — and each new Alertmanager message arrived in the channel
+            # with no thread and no reply on it. From a phone that reads as "the
+            # agent is dead", while it is in fact working two hours upstream in
+            # a thread nobody is looking at. One firing, one message, one thread.
+            INCIDENTS.pop(key, None)
+            if inc.thread:
+                await discord.archive_thread(inc.thread)
+            retire_watched()
         return {"queued": False, "reason": "resolved"}
 
     if inc and now - inc.ran_at < COOLDOWN:
