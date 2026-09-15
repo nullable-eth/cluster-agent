@@ -37,7 +37,7 @@ POLL_S    = int(E("REPLY_POLL_S", "15"))
 # 20 and fixes it. This MUST stay above the gateway's own worst case
 # (REQUEST_MAX_SECONDS + ANSWER_TIMEOUT_S), or the agent hangs up on work that
 # was about to finish and reports a timeout for a run that succeeded.
-LLM_TIMEOUT_S = int(E("LLM_TIMEOUT_S", "1500"))
+LLM_TIMEOUT_S = int(E("LLM_TIMEOUT_S", "1800"))
 # Waits between attempts when the brain is unreachable. Sized to outlast an
 # llm-expert rollout (~12 min: pod restart plus a 29GB GGUF load before
 # llama.cpp binds its port), not to be polite about a blip.
@@ -254,6 +254,38 @@ async def say(inc: Incident | None, text: str) -> None:
 
 
 EMPTY_ANSWER = "(the model returned an empty answer)"
+# Discord's cap is 2000 per message; leave room for the fence and a little slack.
+BLOCK = 1800
+PROMPT_MAX = int(E("PROMPT_ECHO_MAX", "8000"))
+
+
+def latest_prompt(inc: Incident) -> str:
+    """The alert-specific prompt this run is about to act on.
+
+    The newest user turn: the Alertmanager payload on a firing, or the
+    operator's question on a reply. NOT the system prompt — that is the same
+    several thousand characters on every single run, so echoing it would bury
+    the thing that actually differs between one incident and the next.
+    """
+    for m in reversed(inc.messages):
+        if m.get("role") == "user":
+            return str(m.get("content") or "")
+    return "(no prompt)"
+
+
+async def say_block(inc: Incident, header: str, body: str, footer: str = "") -> None:
+    """Post a long verbatim block, fencing each chunk separately.
+
+    post() already splits at 1900 characters, but splitting a single fenced
+    block mid-way leaves the opening ``` in one message and renders the rest as
+    prose. Chunking first and fencing each piece keeps every part readable.
+    """
+    await say(inc, header)
+    body = body[:PROMPT_MAX]
+    for i in range(0, max(len(body), 1), BLOCK):
+        await say(inc, "```\n" + (body[i:i + BLOCK] or " ") + "\n```")
+    if footer:
+        await say(inc, footer)
 
 
 async def investigate(inc: Incident, first: bool) -> None:
@@ -266,9 +298,12 @@ async def investigate(inc: Incident, first: bool) -> None:
     """
     async with inc.lock:
         t0 = time.monotonic()
-        await say(inc, f"⏳ **On it** — `{inc.sha or '········'}` handed to the model, up to "
-                       f"~{LLM_TIMEOUT_S // 60} min of tool work. Actions appear here as they "
-                       f"happen, and a report lands here either way.")
+        await say_block(
+            inc,
+            f"🧵 **ThreadID** `{inc.sha or '········'}` — prompt sent to the model:",
+            latest_prompt(inc),
+            f"Handed over, up to ~{LLM_TIMEOUT_S // 60} min of investigation allowed. "
+            f"Actions appear here as they happen, and a report lands here either way.")
         try:
             report = await ask(inc.trim(), inc.thread)
         except Exception as exc:
