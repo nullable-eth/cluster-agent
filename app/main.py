@@ -32,9 +32,12 @@ MODE      = E("MODE", "propose")            # reported in the prompt; enforced i
 MAX_TOKENS = int(E("LLM_MAX_TOKENS", "4000"))
 COOLDOWN  = int(E("COOLDOWN_S", "900"))
 POLL_S    = int(E("REPLY_POLL_S", "15"))
-# Must exceed the gateway's REQUEST_MAX_SECONDS + ANSWER_TIMEOUT_S (240+150),
-# or the caller abandons answers the gateway was about to give.
-LLM_TIMEOUT_S = int(E("LLM_TIMEOUT_S", "420"))
+# How long to let the model work. Generous on purpose: a run that dies at 5
+# minutes saying it could not determine anything is worse than one that spends
+# 20 and fixes it. This MUST stay above the gateway's own worst case
+# (REQUEST_MAX_SECONDS + ANSWER_TIMEOUT_S), or the agent hangs up on work that
+# was about to finish and reports a timeout for a run that succeeded.
+LLM_TIMEOUT_S = int(E("LLM_TIMEOUT_S", "1500"))
 # Waits between attempts when the brain is unreachable. Sized to outlast an
 # llm-expert rollout (~12 min: pod restart plus a 29GB GGUF load before
 # llama.cpp binds its port), not to be polite about a blip.
@@ -180,14 +183,21 @@ def incident_key(payload: dict) -> str:
     ("alertname · namespace"). That makes re-adoption complete — a restart
     rejoins the thread AND remembers which alert it belongs to.
 
-    Alertmanager groups by exactly these two labels here, so this is the same
-    grouping, just spelled in something both sides can reconstruct.
+    Alertmanager's grouping is the same grouping, just spelled in something
+    both sides can reconstruct.
+
+    Built from EVERY groupLabel, not a hardcoded two, so it stays correct if
+    the routing ever groups by something else (adding `instance` for probes,
+    say, which is what separates two different sites being down into two
+    incidents instead of one thread that means both). Capped because it is also
+    a Discord thread name, and those are limited to 100 characters.
     """
     gl = payload.get("groupLabels") or {}
     name = gl.get("alertname")
     if not name:
         return payload.get("groupKey") or json.dumps(gl, sort_keys=True)
-    return f"{name}{THREAD_SEP}{gl.get('namespace', '')}".strip()
+    rest = [str(v) for k, v in sorted(gl.items()) if k != "alertname" and str(v).strip()]
+    return THREAD_SEP.join([name] + rest)[:100].strip()
 
 
 def presence_text() -> str:
@@ -204,21 +214,41 @@ async def say(inc: Incident | None, text: str) -> None:
     await discord.post((inc.thread if inc and inc.thread else discord.CHANNEL), text)
 
 
+EMPTY_ANSWER = "(the model returned an empty answer)"
+
+
 async def investigate(inc: Incident, first: bool) -> None:
+    """Run one pass, and post SOMETHING to the thread whatever happens.
+
+    Silence is the worst outcome here: an alert sits in the channel with a
+    thread hanging off it and no way to tell "still thinking" from "the brain
+    is down" from "crashed". So this brackets the run — an acknowledgement
+    going in, a report or an explicit failure coming out.
+    """
     async with inc.lock:
         t0 = time.monotonic()
+        await say(inc, f"⏳ **On it** — handed to the model, up to ~{LLM_TIMEOUT_S // 60} min "
+                       f"of tool work. Actions appear here as they happen, and a report "
+                       f"lands here either way.")
         try:
             report = await ask(inc.trim(), inc.thread)
         except Exception as exc:
+            took = int(time.monotonic() - t0)
             log.exception("run failed")
             # The alert is already in the channel, so the absence of a report
             # has to be explained where the alert is.
-            await say(inc, f"**NOT investigated** — `{type(exc).__name__}: {exc}`")
+            await say(inc, f"❌ **No report — the model never answered** (after {took}s).\n"
+                           f"`{type(exc).__name__}: {exc}`\n"
+                           f"Nothing was changed and the alert stands. Reply here to retry.")
+            return
+        took = int(time.monotonic() - t0)
+        if not report.strip() or report.strip() == EMPTY_ANSWER:
+            log.warning("empty report for %s after %ds", inc.name, took)
+            await say(inc, f"❌ **No report — the model answered with nothing** (after {took}s). "
+                           f"Nothing was changed. Reply here to make it try again.")
             return
         inc.messages.append({"role": "assistant", "content": report})
-        took = int(time.monotonic() - t0)
-        head = "" if not first else ""
-        await say(inc, f"{head}{report}\n\n-# {took}s · mode={MODE}")
+        await say(inc, f"{report}\n\n-# {took}s · mode={MODE}")
         log.info("run done: %s in %ds", inc.name, took)
 
 
@@ -253,9 +283,15 @@ async def handle_alert(payload: dict) -> None:
             await say(inc, f"**[cluster-agent] {name}** — could not find the alert message to "
                            f"thread on, so this is in-channel.")
     else:
+        # The FULL payload, exactly like a first firing. This used to send only
+        # groupLabels, and Alertmanager groups by [alertname, namespace] here —
+        # so a re-fire arrived carrying nothing but those two, with every
+        # per-alert label stripped. A ProbeFailed re-fire therefore did not say
+        # WHICH probe was failing, and the agent spent an entire budget
+        # rediscovering a target that was sitting in the payload it never got.
         inc.messages.append({"role": "user", "content":
-                             "The same alert group fired again:\n"
-                             + json.dumps(payload.get("groupLabels", {}), indent=1)})
+                             "The same alert group fired again. Current payload:\n"
+                             + json.dumps(payload, indent=1)[:6000]})
 
     inc.ran_at = time.time()
     await investigate(inc, first=True)
