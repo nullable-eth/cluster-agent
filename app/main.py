@@ -1,19 +1,19 @@
 """cluster-agent — alert-triggered reconciler that argues back.
 
-Flow: Alertmanager posts the alert to #cluster-alerts AND webhooks this process.
-The agent finds that exact message, opens a thread on it, and works there: its
-report goes in the thread, its actions are announced in the thread as the
-gateway runs them, the operator replies in the thread from a phone, the agent
-answers, and Prometheus's own RESOLVED closes the thread out. One incident, one
-readable trail, no context to reconstruct.
+Flow: Alertmanager posts the alert to #cluster-alerts (its own webhook, so the
+alert is seen even if this process is dead) AND webhooks this process. The
+agent opens a post for it in the #agent-actions forum and works there: the
+alert, its report, its actions (announced by the gateway as they run), the
+operator's replies from a phone, and Prometheus's own RESOLVED, one post per
+incident. Tags on the post show where it stands; a resolved post is archived.
 
 This process owns no tools and holds no cluster credentials. The tool loop,
 kubectl, Home Assistant, memory and silences all live in the gateway behind
-LLM_URL; what lives here is the conversation: take the webhook, find the
-message, hold the thread, and make sure every alert ends with either a report
-or an explanation of why there isn't one.
+LLM_URL; what lives here is the conversation: take the webhook, open the post,
+hold it, and make sure every alert ends with either a report or an
+explanation of why there isn't one.
 """
-import asyncio, hashlib, json, logging, os, time
+import asyncio, hashlib, json, logging, os, re, time
 
 import httpx
 from fastapi import FastAPI, Request
@@ -110,6 +110,9 @@ class Incident:
         # Short id for THIS firing, carried in the thread title and the prompt
         # so one outage can be told from the next and quoted back later.
         self.sha: str = ""
+        self.title: str = ""
+        # Forum tags currently on the post (normalised names).
+        self.tags: set[str] = set()
         self.messages: list[dict] = []
         self.last_seen: str | None = None
         self.ran_at: float = 0.0
@@ -197,15 +200,83 @@ def sha_from_title(title: str) -> str:
 def presence_text() -> str:
     """What the member list says the bot is doing, so "up" is legible at a glance."""
     n = len(BY_THREAD)
-    return "the cluster" if not n else f"{n} incident thread{'' if n == 1 else 's'}"
+    return "the cluster" if not n else f"{n} incident post{'' if n == 1 else 's'}"
 
 
 async def say(inc: Incident | None, text: str) -> None:
-    """Into the incident thread if there is one, else the channel itself."""
+    """Into the incident's post; a new post if it has none or it was deleted."""
     if not discord.enabled():
         log.info("discord disabled; would have said: %s", text[:200])
         return
-    await discord.post((inc.thread if inc and inc.thread else discord.CHANNEL), text)
+    if inc is None:
+        # Not about one incident (the agent itself failing): its own post, so
+        # it is seen and not lost in an unrelated incident.
+        await discord.create_post("cluster-agent · notice", text, ["operator-needed"])
+        return
+    if inc.thread:
+        try:
+            await discord.post(inc.thread, text)
+            return
+        except discord.ThreadGone:
+            forget(inc)
+    # No post yet, or the operator deleted it: open a fresh one rather than
+    # talking into a post nobody can see.
+    inc.thread = await discord.create_post(
+        inc.title or inc.key, "-# the earlier post for this incident is gone; continuing here.\n" + text,
+        inc.tags or ["firing"])
+    if inc.thread:
+        BY_THREAD[inc.thread] = inc
+        if not inc.resolved:
+            INCIDENTS[inc.key] = inc
+
+
+async def tag(inc: Incident, *names: str) -> None:
+    """Set the post's tags to exactly these."""
+    inc.tags = set(names)
+    if not (inc.thread and discord.enabled()):
+        return
+    try:
+        await discord.set_tags(inc.thread, inc.tags)
+    except discord.ThreadGone:
+        forget(inc)
+
+
+# The model ends every report with one of these (see prompt.CORE).
+STATUS_RE = re.compile(r"^\s*\**\s*STATUS:\s*\**\s*(fixed|operator-needed|investigating)\b.*$",
+                       re.IGNORECASE | re.MULTILINE)
+
+
+def report_status(report: str) -> tuple[str, str]:
+    """(status, report without the status line). No status means a human looks."""
+    found = list(STATUS_RE.finditer(report))
+    if not found:
+        return "operator-needed", report
+    m = found[-1]
+    return m.group(1).lower(), (report[:m.start()] + report[m.end():]).strip()
+
+
+def alert_summary(payload: dict) -> str:
+    """The post's opening message: what fired, readable on a phone."""
+    gl = payload.get("groupLabels") or {}
+    alerts = payload.get("alerts") or []
+    common = payload.get("commonLabels") or {}
+    head = f"🔥 **{gl.get('alertname', 'alert')}**"
+    if gl.get("namespace"):
+        head += f" · `{gl['namespace']}`"
+    if common.get("severity"):
+        head += f" · {common['severity']}"
+    lines = [head]
+    ann = payload.get("commonAnnotations") or {}
+    if ann.get("summary"):
+        lines.append(ann["summary"])
+    for al in alerts[:10]:
+        lb = al.get("labels") or {}
+        what = lb.get("pod") or lb.get("instance") or lb.get("deployment") or lb.get("node") or ""
+        desc = (al.get("annotations") or {}).get("description") or ""
+        lines.append(f"- {('`' + what + '` ') if what else ''}{desc[:300]}")
+    if len(alerts) > 10:
+        lines.append(f"- … and {len(alerts) - 10} more")
+    return "\n".join(lines)
 
 
 EMPTY_ANSWER = "(the model returned an empty answer)"
@@ -253,6 +324,7 @@ async def investigate(inc: Incident, first: bool) -> None:
     """
     async with inc.lock:
         t0 = time.monotonic()
+        await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), "investigating")
         await say_block(
             inc,
             f"🧵 **ThreadID** `{inc.sha or '········'}` — prompt sent to the model:",
@@ -269,15 +341,19 @@ async def investigate(inc: Incident, first: bool) -> None:
             await say(inc, f"❌ **No report — the model never answered** (after {took}s).\n"
                            f"`{type(exc).__name__}: {exc}`\n"
                            f"Nothing was changed and the alert stands. Reply here to retry.")
+            await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), "operator-needed")
             return
         took = int(time.monotonic() - t0)
         if not report.strip() or report.strip() == EMPTY_ANSWER:
             log.warning("empty report for %s after %ds", inc.name, took)
             await say(inc, f"❌ **No report — the model answered with nothing** (after {took}s). "
                            f"Nothing was changed. Reply here to make it try again.")
+            await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), "operator-needed")
             return
         inc.messages.append({"role": "assistant", "content": report})
-        await say(inc, f"{report}\n\n-# {took}s · mode={MODE}")
+        status, shown = report_status(report)
+        await say(inc, f"{shown}\n\n-# {took}s · mode={MODE} · status={status}")
+        await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), status)
         log.info("run done: %s in %ds", inc.name, took)
 
 
@@ -288,32 +364,34 @@ async def handle_alert(payload: dict) -> None:
     name = labels.get("alertname", "unknown-alert")
     inc = INCIDENTS.get(key)
 
+    if inc is not None and inc.thread and discord.enabled():
+        # The operator may have deleted the post; a deleted post is a closed
+        # conversation, so this firing starts a new one.
+        try:
+            await discord.channel(inc.thread)
+        except discord.ThreadGone:
+            forget(inc)
+            inc = None
+
     if inc is None:
-        thread = None
-        if discord.enabled():
-            # Wait for Alertmanager's own post before doing anything: the
-            # channel learns about an alert before the agent acts on it, which
-            # is the invariant, and the message is also the thread's anchor.
-            mid = await discord.find_alert_message(name, labels, time.time())
-            if mid:
-                # The title IS the key (see incident_key): a restart reads it
-                # back and knows which alert this thread belongs to.
-                thread = await discord.open_thread(mid, thread_title(key, sha))
-            else:
-                log.warning("no Alertmanager message found for %s; reporting in-channel", name)
-        inc = Incident(key, name, thread)
+        inc = Incident(key, name, None)
         inc.sha = sha
+        # The title IS the key (see incident_key): a restart reads it back
+        # and knows which alert this post belongs to.
+        inc.title = thread_title(key, sha)
+        inc.tags = {"firing", "investigating"}
         inc.messages = [{"role": "system", "content": SYSTEM},
                         {"role": "user", "content":
                          f"Incident {sha} ({key}).\n"
                          "Alertmanager payload:\n" + json.dumps(payload, indent=1)[:6000]}]
+        if discord.enabled():
+            inc.thread = await discord.create_post(inc.title, alert_summary(payload), inc.tags)
+            if not inc.thread:
+                log.warning("could not open a post for %s", name)
         INCIDENTS[key] = inc
-        if thread:
-            BY_THREAD[thread] = inc
+        if inc.thread:
+            BY_THREAD[inc.thread] = inc
             await gateway.set_presence(presence_text())
-        if not thread:
-            await say(inc, f"**[cluster-agent] {name}** — could not find the alert message to "
-                           f"thread on, so this is in-channel.")
     else:
         # The FULL payload, exactly like a first firing. This used to send only
         # groupLabels, and Alertmanager groups by [alertname, namespace] here —
@@ -376,7 +454,9 @@ async def rehydrate(thread_id: str) -> Incident | None:
     key = title.rsplit(THREAD_SEP, 1)[0] if sha_from_title(title) else title
     inc = Incident(key, key.split(THREAD_SEP)[0] or "incident", thread_id)
     inc.sha = sha_from_title(title)
-    inc.resolved = bool((ch.get("thread_metadata") or {}).get("archived"))
+    inc.title = title
+    inc.tags = discord.tag_names(ch.get("applied_tags"))
+    inc.resolved = bool((ch.get("thread_metadata") or {}).get("archived")) or "resolved" in inc.tags
 
     msgs = await discord.history(thread_id)
     convo: list[dict] = []
@@ -530,6 +610,7 @@ async def _start() -> None:
         SELF_ID = await discord.me()
         if SELF_ID:
             discord.remember_self(SELF_ID)   # lets history() tell our voice from theirs
+        await discord.load_tags()
         # Re-adopt the threads we were already in, so a restart does not strand
         # a conversation mid-incident. Their history is gone; the thread is not.
         for t in await discord.active_threads():
@@ -543,6 +624,8 @@ async def _start() -> None:
             inc = Incident(key or f"adopted:{t['id']}",
                            key.split(THREAD_SEP)[0] or "incident", t["id"])
             inc.sha = sha
+            inc.title = title
+            inc.tags = discord.tag_names(t.get("applied_tags"))
             # Routing only. The conversation is left empty and hydrated=False:
             # the first reply reads the thread back out of Discord, so a
             # question after a restart is answered with the real history rather
@@ -551,7 +634,7 @@ async def _start() -> None:
             inc.messages = [{"role": "system", "content": SYSTEM}]
             INCIDENTS[inc.key] = inc
             BY_THREAD[t["id"]] = inc
-        log.info("adopted %d open thread(s)", len(BY_THREAD))
+        log.info("adopted %d open post(s)", len(BY_THREAD))
         # The socket: replies land instantly, and the bot shows as online in the
         # member list — which is the only way to tell "watching" from "dead",
         # since both look like an empty channel.
@@ -576,26 +659,22 @@ async def alert(req: Request) -> dict:
     now = time.time()
 
     if status == "resolved":
-        # Prometheus closing the loop, in the same thread as everything else.
-        # Falls back to the channel only when there is genuinely no thread —
-        # the alert message was never found, or this resolve is for something
-        # that fired before the agent existed. Saying it in the channel beats
-        # saying nothing, which is what a dropped resolve looks like.
-        await say(inc, f"✅ **Resolved** — Prometheus says {name} has cleared."
-                  if not inc else "✅ **Resolved** — Prometheus says this alert has cleared.")
-        if inc:
-            inc.ran_at = 0.0
-            inc.resolved = True
-            # RETIRE the incident. It used to live in INCIDENTS forever, so
-            # every later firing of the same alert was appended to the FIRST
-            # thread — and each new Alertmanager message arrived in the channel
-            # with no thread and no reply on it. From a phone that reads as "the
-            # agent is dead", while it is in fact working two hours upstream in
-            # a thread nobody is looking at. One firing, one message, one thread.
-            INCIDENTS.pop(key, None)
-            if inc.thread:
-                await discord.archive_thread(inc.thread)
-            retire_watched()
+        # Prometheus closing the loop, in the same post as everything else. A
+        # resolve for something the agent never saw has no post, and needs
+        # none: #cluster-alerts has the whole story.
+        if not inc:
+            log.info("resolved %s with no open post; nothing to close", name)
+            return {"queued": False, "reason": "resolved"}
+        await say(inc, "✅ **Resolved** — Prometheus says this alert has cleared.")
+        inc.ran_at = 0.0
+        inc.resolved = True
+        # RETIRE the incident, so the next firing of the same alert opens its
+        # own post instead of appending to this one.
+        INCIDENTS.pop(key, None)
+        if inc.thread:
+            await tag(inc, "resolved", *(["fixed"] if "fixed" in inc.tags else []))
+            await discord.archive_thread(inc.thread)
+        retire_watched()
         return {"queued": False, "reason": "resolved"}
 
     if inc and now - inc.ran_at < COOLDOWN:

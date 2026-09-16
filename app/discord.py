@@ -1,17 +1,16 @@
-"""The Discord side of the agent: one channel, one thread per alert.
+"""The Discord side of the agent: one forum post per alert.
 
-A webhook could only shout. This is a bot, because the whole point is the
-conversation: Alertmanager posts the alert, the agent opens a THREAD on that
-exact message and works there, the operator replies in the thread from wherever
-they are, and Prometheus's own RESOLVED lands in the same place. The thread is
-the incident record — alert, diagnosis, actions, argument, outcome, in order.
+Alertmanager posts every alert to #cluster-alerts with its webhook, on its own,
+so an alert is visible even when the agent is dead. The agent works in a
+separate FORUM channel (DISCORD_CHANNEL_ID, #agent-actions): each alert it
+receives opens its own post, and the post is the incident record: the alert,
+the diagnosis, every action (posted by the gateway), the operator's replies
+and the outcome, contained in one place that can be read, answered and deleted
+as a unit. Tags on the post say where it stands (firing, investigating, fixed,
+operator-needed, resolved), and a resolved post is archived.
 
-Why the agent does not post the alert itself: then Discord would depend on the
-agent being alive, and the agent being dead is exactly when the alert matters.
-Alertmanager posts; the agent finds that message and threads on it. Finding it
-also enforces the rule that the channel is told before the agent acts, which no
-amount of Alertmanager config could guarantee (its integrations fan out in
-parallel).
+An alert in #cluster-alerts with no matching post here means the agent is not
+working; that is the health signal, so the agent never posts in that channel.
 """
 import asyncio, logging, os, re, time
 
@@ -23,8 +22,6 @@ API = "https://discord.com/api/v10"
 E = os.environ.get
 TOKEN = E("DISCORD_BOT_TOKEN", "")
 CHANNEL = E("DISCORD_CHANNEL_ID", "")
-# Alertmanager and the agent race; the alert usually lands first but not always.
-FIND_TIMEOUT_S = int(E("ALERT_FIND_TIMEOUT_S", "45"))
 # 7 days. An incident nobody replied to in a week is over, one way or another.
 AUTO_ARCHIVE_MIN = int(E("THREAD_AUTO_ARCHIVE_MIN", "10080"))
 LIMIT = 1900          # Discord hard-caps a message at 2000 characters
@@ -62,13 +59,15 @@ async def post(channel_or_thread: str, text: str) -> str | None:
                              {"content": text[i:i + LIMIT],
                               "allowed_mentions": {"parse": []}})
         if s == 404 or s == 403:
-            # Most likely an archived thread: posting to one is refused until it
+            # Most likely an archived post: posting to one is refused until it
             # is reopened, and a week-old incident that comes back is exactly
-            # when you want the old context, not a fresh thread.
+            # when you want the old context, not a fresh post.
             await call("PATCH", f"/channels/{channel_or_thread}", {"archived": False})
             s, body = await call("POST", f"/channels/{channel_or_thread}/messages",
                                  {"content": text[i:i + LIMIT],
                                   "allowed_mentions": {"parse": []}})
+            if s == 404:
+                raise ThreadGone(channel_or_thread)
         if s >= 300:
             log.warning("discord post failed %s: %s", s, str(body)[:200])
             return first
@@ -76,56 +75,66 @@ async def post(channel_or_thread: str, text: str) -> str | None:
     return first
 
 
-def _mentions(text: str, alertname: str, labels: dict) -> bool:
-    if alertname and alertname.lower() in text.lower():
-        return True
-    return False
+# Forum tags, by normalised name ("🔥 firing" and "firing" are the same tag).
+TAGS: dict[str, str] = {}
+TAG_NAMES: dict[str, str] = {}
 
 
-async def find_alert_message(alertname: str, labels: dict, since: float) -> str | None:
-    """Find the Alertmanager post for this alert, and wait for it if need be.
-
-    Matching is on the alertname in the message body or embed, plus "posted
-    recently" and "has no thread yet". Alertmanager groups by alertname +
-    namespace, so two firing groups with the same alertname in the same
-    namespace would be one message anyway.
-    """
-    deadline = time.monotonic() + FIND_TIMEOUT_S
-    ns = (labels or {}).get("namespace", "")
-    while time.monotonic() < deadline:
-        s, msgs = await call("GET", f"/channels/{CHANNEL}/messages?limit=15")
-        if s == 200 and isinstance(msgs, list):
-            for m in msgs:
-                if m.get("thread"):
-                    continue                      # already has a thread
-                ts = m.get("timestamp") or ""
-                blob = (m.get("content") or "")
-                for e in m.get("embeds") or []:
-                    blob += " " + (e.get("title") or "") + " " + (e.get("description") or "")
-                if not _mentions(blob, alertname, labels):
-                    continue
-                if ns and ns not in blob:
-                    # namespace is in Alertmanager's title; if it disagrees this
-                    # is a different group with the same alertname.
-                    continue
-                if "[RESOLVED]" in blob:
-                    continue
-                return m["id"]
-        await asyncio.sleep(3)
-    return None
+def _norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9-]", "", (name or "").lower())
 
 
-async def open_thread(message_id: str, name: str) -> str | None:
-    s, body = await call("POST", f"/channels/{CHANNEL}/messages/{message_id}/threads",
-                         {"name": name[:100], "auto_archive_duration": AUTO_ARCHIVE_MIN})
-    if s in (200, 201):
-        return (body or {}).get("id")
-    if s == 400 and body and "already has a thread" in str(body).lower():
-        s2, m = await call("GET", f"/channels/{CHANNEL}/messages/{message_id}")
-        if s2 == 200:
-            return ((m or {}).get("thread") or {}).get("id")
-    log.warning("thread create failed %s: %s", s, str(body)[:200])
-    return None
+async def load_tags() -> None:
+    """Read the forum's tags, so posts can be tagged by name."""
+    s, ch = await call("GET", f"/channels/{CHANNEL}")
+    if s != 200 or not ch:
+        log.error("cannot read channel %s: HTTP %s", CHANNEL, s)
+        return
+    if ch.get("type") != 15:
+        log.error("DISCORD_CHANNEL_ID %s is not a forum channel (type %s)", CHANNEL, ch.get("type"))
+    for t in ch.get("available_tags") or []:
+        TAGS[_norm(t["name"])] = t["id"]
+        TAG_NAMES[t["id"]] = _norm(t["name"])
+    log.info("forum tags: %s", ", ".join(sorted(TAGS)) or "(none)")
+
+
+def tag_ids(names) -> list[str]:
+    """Known tags only, at most 5 (Discord's limit per post)."""
+    out = [TAGS[_norm(n)] for n in names if _norm(n) in TAGS]
+    return list(dict.fromkeys(out))[:5]
+
+
+def tag_names(ids) -> set[str]:
+    return {TAG_NAMES[i] for i in (ids or []) if i in TAG_NAMES}
+
+
+async def create_post(title: str, text: str, tags) -> str | None:
+    """Open a forum post. Returns its id (a thread id), or None."""
+    s, body = await call("POST", f"/channels/{CHANNEL}/threads", {
+        "name": title[:100],
+        "auto_archive_duration": AUTO_ARCHIVE_MIN,
+        "applied_tags": tag_ids(tags),
+        "message": {"content": text[:LIMIT], "allowed_mentions": {"parse": []}},
+    })
+    if s not in (200, 201) or not body:
+        log.warning("post create failed %s: %s", s, str(body)[:200])
+        return None
+    tid = body.get("id")
+    if tid and len(text) > LIMIT:
+        await post(tid, text[LIMIT:])
+    return tid
+
+
+async def set_tags(thread_id: str, names) -> None:
+    s, body = await call("PATCH", f"/channels/{thread_id}", {"applied_tags": tag_ids(names)})
+    if s == 400 and "archived" in str(body).lower():
+        # An archived post can only be edited while reopening it.
+        s, body = await call("PATCH", f"/channels/{thread_id}",
+                             {"archived": False, "applied_tags": tag_ids(names)})
+    if s == 404:
+        raise ThreadGone(thread_id)
+    if s >= 300:
+        log.warning("could not tag %s: %s %s", thread_id, s, str(body)[:120])
 
 
 async def me() -> str | None:
@@ -216,12 +225,12 @@ def remember_self(user_id: str) -> None:
 
 
 async def archive_thread(thread_id: str) -> None:
-    """Close a thread out when its incident resolves.
+    """Close a post out when its incident resolves.
 
     Two jobs. It reads as finished in the client, and it drops out of the
-    guild's ACTIVE thread list — so a restart does not re-adopt a thread whose
+    guild's ACTIVE thread list — so a restart does not re-adopt a post whose
     incident is over and start appending the next outage to it. Posting to an
-    archived thread reopens it (see post), so an operator reply still works.
+    archived post reopens it (see post), so an operator reply still works.
     """
     s, _ = await call("PATCH", f"/channels/{thread_id}", {"archived": True})
     if s >= 300:
@@ -229,7 +238,7 @@ async def archive_thread(thread_id: str) -> None:
 
 
 async def active_threads() -> list[dict]:
-    """Threads already open on our channel, so a restart rejoins its incidents."""
+    """Posts still open in the forum, so a restart rejoins its incidents."""
     s, ch = await call("GET", f"/channels/{CHANNEL}")
     guild = (ch or {}).get("guild_id") if s == 200 else None
     if not guild:
