@@ -51,13 +51,18 @@ async def call(method: str, path: str, json=None, retries: int = 3):
     return 599, None
 
 
-async def post(channel_or_thread: str, text: str) -> str | None:
-    """Post, chunked. Returns the id of the first message, or None."""
+async def post(channel_or_thread: str, text: str, mention: list[str] | None = None) -> str | None:
+    """Post, chunked. Returns the id of the first message, or None.
+
+    Nothing in the text can ping anyone unless its user id is in `mention`:
+    a report quoting "@everyone" from a log must not page a server.
+    """
     first = None
+    allowed = {"parse": [], "users": list(mention or [])[:100]}
     for i in range(0, len(text), LIMIT):
         s, body = await call("POST", f"/channels/{channel_or_thread}/messages",
                              {"content": text[i:i + LIMIT],
-                              "allowed_mentions": {"parse": []}})
+                              "allowed_mentions": allowed})
         if s == 404 or s == 403:
             # Most likely an archived post: posting to one is refused until it
             # is reopened, and a week-old incident that comes back is exactly
@@ -65,7 +70,7 @@ async def post(channel_or_thread: str, text: str) -> str | None:
             await call("PATCH", f"/channels/{channel_or_thread}", {"archived": False})
             s, body = await call("POST", f"/channels/{channel_or_thread}/messages",
                                  {"content": text[i:i + LIMIT],
-                                  "allowed_mentions": {"parse": []}})
+                                  "allowed_mentions": allowed})
             if s == 404:
                 raise ThreadGone(channel_or_thread)
         if s >= 300:

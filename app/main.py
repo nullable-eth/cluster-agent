@@ -50,6 +50,10 @@ KEEP_TURNS = int(E("KEEP_TURNS", "12"))
 # Each incident is still worked one run at a time (Incident.lock).
 WORKERS = int(E("AGENT_WORKERS", "2"))
 EMPTY_ANSWER = "(the model returned an empty answer)"
+# Discord user ids to @mention when a report ends in one of NOTIFY_ON, so the
+# operator's phone rings when the agent is waiting on them. Empty: no pings.
+NOTIFY_USERS = [u.strip() for u in E("DISCORD_NOTIFY_USERS", "").split(",") if u.strip()]
+NOTIFY_ON = {s.strip() for s in E("DISCORD_NOTIFY_ON", "awaiting-reply").split(",") if s.strip()}
 
 
 # The playbook comes from the operator's own IaC (a mounted ConfigMap), so the
@@ -248,7 +252,7 @@ def presence_text() -> str:
     return "the cluster" if not n else f"{n} incident post{'' if n == 1 else 's'}"
 
 
-async def say(inc: Incident | None, text: str) -> None:
+async def say(inc: Incident | None, text: str, mention: list[str] | None = None) -> None:
     """Into the incident's post; a new post if it has none or it was deleted."""
     if not discord.enabled():
         log.info("discord disabled; would have said: %s", text[:200])
@@ -260,7 +264,7 @@ async def say(inc: Incident | None, text: str) -> None:
         return
     if inc.thread:
         try:
-            await discord.post(inc.thread, text)
+            await discord.post(inc.thread, text, mention)
             return
         except discord.ThreadGone:
             forget(inc)
@@ -287,7 +291,7 @@ async def tag(inc: Incident, *names: str) -> None:
 
 
 # The model ends every report with one of these (see prompt.CORE).
-STATUS_RE = re.compile(r"^\s*\**\s*STATUS:\s*\**\s*(fixed|operator-needed|investigating)\b.*$",
+STATUS_RE = re.compile(r"^\s*\**\s*STATUS:\s*\**\s*(fixed|awaiting-reply|operator-needed|investigating)\b.*$",
                        re.IGNORECASE | re.MULTILINE)
 
 
@@ -454,8 +458,10 @@ async def investigate(inc: Incident, first: bool) -> None:
         status, shown = report_status(report)
         if progress.reads:
             await progress.render()
-        await say(inc, f"{shown}\n\n-# {took}s · {progress.reads} reads · "
-                       f"{progress.actions} actions · mode={MODE} · status={status}")
+        ping = NOTIFY_USERS if status in NOTIFY_ON else []
+        lead = " ".join(f"<@{u}>" for u in ping)
+        await say(inc, (lead + "\n" if lead else "") + f"{shown}\n\n-# {took}s · {progress.reads} reads · "
+                       f"{progress.actions} actions · mode={MODE} · status={status}", ping)
         await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), status)
         log.info("run done: %s in %ds", inc.name, took)
 
