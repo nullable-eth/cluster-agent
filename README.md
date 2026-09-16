@@ -3,8 +3,7 @@
 An alert-triggered autonomous SRE for a GitOps-managed Kubernetes cluster.
 Alertmanager POSTs alerts to `/alert`; the agent investigates with a local
 OpenAI-compatible LLM (native tool calling required), guarded `kubectl`, and
-optional Home Assistant / memory-service tools, then reports to a Discord
-webhook. Designed to run fully offline: every dependency is in-cluster or
+optional Home Assistant / memory-service tools, then reports in a Discord forum post per alert. Designed to run fully offline: every dependency is in-cluster or
 on-LAN; the Discord audit trail is fire-and-forget and never blocks.
 
 ## Safety model
@@ -30,7 +29,7 @@ on-LAN; the Discord audit trail is fire-and-forget and never blocks.
 | `LLM_MODEL` | `default` | Model name to request |
 | `LLM_API_KEY` | *(empty)* | Bearer key for the LLM endpoint |
 | `MODE` | `propose` | `propose` or `auto` |
-| `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | *(empty)* | The bot and the alert channel it threads incidents in. Bot only: webhooks are Alertmanager's |
+| `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | *(empty)* | The bot and the FORUM channel it opens one post per alert in. Tags used if present: `firing`, `investigating`, `fixed`, `operator-needed`, `resolved`. Bot only: Alertmanager posts the alerts elsewhere with its own webhook |
 | `HA_URL` / `HA_TOKEN` | *(empty)* | Home Assistant; empty disables HA tools |
 | `MEMORY_URL` / `MEMORY_READ_TOKEN` | *(empty)* | agentmemory `/search`; empty disables |
 | `PROTECTED` | `cluster-agent` | Comma list of self-preservation targets |
