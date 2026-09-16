@@ -30,7 +30,7 @@ on-LAN; the Discord audit trail is fire-and-forget and never blocks.
 | `LLM_MODEL` | `default` | Model name to request |
 | `LLM_API_KEY` | *(empty)* | Bearer key for the LLM endpoint |
 | `MODE` | `propose` | `propose` or `auto` |
-| `DISCORD_WEBHOOK` | *(empty)* | Audit channel webhook; optional |
+| `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | *(empty)* | The bot and the alert channel it threads incidents in. Bot only: webhooks are Alertmanager's |
 | `HA_URL` / `HA_TOKEN` | *(empty)* | Home Assistant; empty disables HA tools |
 | `MEMORY_URL` / `MEMORY_READ_TOKEN` | *(empty)* | agentmemory `/search`; empty disables |
 | `PROTECTED` | `cluster-agent` | Comma list of self-preservation targets |
