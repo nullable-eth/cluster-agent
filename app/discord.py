@@ -12,7 +12,7 @@ operator-needed, resolved), and a resolved post is archived.
 An alert in #cluster-alerts with no matching post here means the agent is not
 working; that is the health signal, so the agent never posts in that channel.
 """
-import asyncio, logging, os, re, time
+import asyncio, json, logging, os, re, time
 
 import httpx
 
@@ -51,13 +51,18 @@ async def call(method: str, path: str, json=None, retries: int = 3):
     return 599, None
 
 
-async def post(channel_or_thread: str, text: str) -> str | None:
-    """Post, chunked. Returns the id of the first message, or None."""
+async def post(channel_or_thread: str, text: str, mention: list[str] | None = None) -> str | None:
+    """Post, chunked. Returns the id of the first message, or None.
+
+    Nothing in the text can ping anyone unless its user id is in `mention`:
+    a report quoting "@everyone" from a log must not page a server.
+    """
     first = None
+    allowed = {"parse": [], "users": list(mention or [])[:100]}
     for i in range(0, len(text), LIMIT):
         s, body = await call("POST", f"/channels/{channel_or_thread}/messages",
                              {"content": text[i:i + LIMIT],
-                              "allowed_mentions": {"parse": []}})
+                              "allowed_mentions": allowed})
         if s == 404 or s == 403:
             # Most likely an archived post: posting to one is refused until it
             # is reopened, and a week-old incident that comes back is exactly
@@ -65,7 +70,7 @@ async def post(channel_or_thread: str, text: str) -> str | None:
             await call("PATCH", f"/channels/{channel_or_thread}", {"archived": False})
             s, body = await call("POST", f"/channels/{channel_or_thread}/messages",
                                  {"content": text[i:i + LIMIT],
-                                  "allowed_mentions": {"parse": []}})
+                                  "allowed_mentions": allowed})
             if s == 404:
                 raise ThreadGone(channel_or_thread)
         if s >= 300:
@@ -73,6 +78,27 @@ async def post(channel_or_thread: str, text: str) -> str | None:
             return first
         first = first or (body or {}).get("id")
     return first
+
+
+async def post_file(thread_id: str, text: str, filename: str, data: bytes) -> None:
+    """One message with a file attached (the run transcript)."""
+    headers = {"Authorization": f"Bot {TOKEN}",
+               "User-Agent": "cluster-agent (+https://github.com/nullable-eth/cluster-agent, 1.0)"}
+    payload = {"content": text[:LIMIT], "allowed_mentions": {"parse": []},
+               "attachments": [{"id": 0, "filename": filename}]}
+    for attempt in range(3):
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(f"{API}/channels/{thread_id}/messages", headers=headers,
+                             data={"payload_json": json.dumps(payload)},
+                             files={"files[0]": (filename, data, "text/markdown")})
+        if r.status_code == 429:
+            await asyncio.sleep(float((r.json() or {}).get("retry_after", 1.0)) + 0.25)
+            continue
+        if r.status_code == 404:
+            raise ThreadGone(thread_id)
+        if r.status_code >= 300:
+            log.warning("file post failed %s: %s", r.status_code, r.text[:200])
+        return
 
 
 async def edit(thread_id: str, message_id: str, text: str) -> None:

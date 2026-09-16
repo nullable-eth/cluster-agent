@@ -29,7 +29,10 @@ on-LAN; the Discord audit trail is fire-and-forget and never blocks.
 | `LLM_MODEL` | `default` | Model name to request |
 | `LLM_API_KEY` | *(empty)* | Bearer key for the LLM endpoint |
 | `MODE` | `propose` | `propose` or `auto` |
-| `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | *(empty)* | The bot and the FORUM channel it opens one post per alert in. Tags used if present: `firing`, `investigating`, `fixed`, `operator-needed`, `resolved`. Bot only: Alertmanager posts the alerts elsewhere with its own webhook |
+| `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | *(empty)* | The bot and the FORUM channel it opens one post per alert in. Tags used if present (matched by name): `firing`, `investigating`, `fixed`, `awaiting-reply`, `operator-needed`, `resolved`. Bot only: Alertmanager posts the alerts elsewhere with its own webhook |
+| `DISCORD_NOTIFY_USERS` | *(empty)* | Comma-separated Discord user ids to @mention when a report ends in a `DISCORD_NOTIFY_ON` status. Empty: never pings anyone |
+| `DISCORD_NOTIFY_ON` | `awaiting-reply` | Comma-separated statuses that ping `DISCORD_NOTIFY_USERS` |
+| `AGENT_WORKERS` | `2` | Alerts investigated in parallel (one run per incident at a time) |
 | `HA_URL` / `HA_TOKEN` | *(empty)* | Home Assistant; empty disables HA tools |
 | `MEMORY_URL` / `MEMORY_READ_TOKEN` | *(empty)* | agentmemory `/search`; empty disables |
 | `PROTECTED` | `cluster-agent` | Comma list of self-preservation targets |
