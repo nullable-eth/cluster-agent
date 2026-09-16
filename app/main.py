@@ -74,7 +74,11 @@ STREAM_IDLE_S = int(E("STREAM_IDLE_S", "180"))
 
 
 async def _stream(body: dict, headers: dict, on_event) -> str:
-    """One streamed request. Tool events go to on_event; returns the answer."""
+    """One streamed request; returns all content.
+
+    Every delta goes to on_event(kind, value) as it arrives, in order:
+    ("reasoning", text), ("content", text) and ("tool", event).
+    """
     content: list[str] = []
     timeout = httpx.Timeout(STREAM_IDLE_S, connect=15)
     async with httpx.AsyncClient(timeout=timeout) as c:
@@ -94,14 +98,19 @@ async def _stream(body: dict, headers: dict, on_event) -> str:
                 except ValueError:
                     continue
                 delta = ((obj.get("choices") or [{}])[0].get("delta")) or {}
-                ev = delta.get("tool_event")
-                if ev and on_event is not None:
-                    try:
-                        await on_event(ev)
-                    except Exception:
-                        log.exception("tool event handler failed; continuing")
                 if delta.get("content"):
                     content.append(delta["content"])
+                if on_event is None:
+                    continue
+                for kind, val in (("reasoning", delta.get("reasoning_content")),
+                                  ("tool", delta.get("tool_event")),
+                                  ("content", delta.get("content"))):
+                    if not val:
+                        continue
+                    try:
+                        await on_event(kind, val)
+                    except Exception:
+                        log.exception("stream handler failed on %s; continuing", kind)
     text = "".join(content).strip()
     m = GATEWAY_FAIL.search(text)
     if m:
@@ -372,49 +381,114 @@ def _fmt_call(ev: dict) -> str:
 
 
 class Progress:
-    """Shows the loop's tool calls in the post as they happen.
+    """The run, as it happens: a timeline in the post, a full record on file.
 
-    Actions (anything that changes something) get their own messages, before
-    and after, so they are never lost in a scroll. Reads are counted in a
-    single status message that is edited in place (at most every few
-    seconds), so forty `kubectl get`s read as one line, not forty.
+    In the post, in order:
+    - the model's narration between steps, as ordinary messages;
+    - reads, a few lines per message: each burst of reads fills one message
+      in place, and the next narration or action starts a new one, so the
+      whole sequence stays visible without forty separate messages;
+    - every action, its own message before and after.
+    What is left after the last step is the report, returned by final().
+
+    Everything, including the model's reasoning and each tool's output, is kept
+    in the transcript, which is attached to the post when the run ends: too
+    long for chat messages, too useful to throw away.
     """
-    EDIT_EVERY_S = 4.0
+    EDIT_EVERY_S = 2.0
+    BLOCK_MAX = 1700
+    TRANSCRIPT_MAX = 400_000
 
     def __init__(self, inc: "Incident"):
         self.inc, self.reads, self.actions = inc, 0, 0
-        self.msg: str | None = None
-        self.last_edit, self.last_read = 0.0, ""
+        self.text: list[str] = []            # narration since the last tool call
+        self.block: list[str] = []           # read lines in the current message
+        self.block_msg: str | None = None
+        self.shown = 0                       # block lines already in Discord
+        self.last_edit = 0.0
+        self.trace: list[tuple[str, str]] = []
 
-    async def __call__(self, ev: dict) -> None:
-        if ev.get("mutating"):
-            if ev.get("phase") == "call":
+    def _log(self, kind: str, text: str) -> None:
+        if self.trace and self.trace[-1][0] == kind and kind in ("reasoning", "content"):
+            self.trace[-1] = (kind, self.trace[-1][1] + text)
+        else:
+            self.trace.append((kind, text))
+
+    async def __call__(self, kind: str, val) -> None:
+        if kind == "reasoning":
+            self._log("reasoning", val)
+            return
+        if kind == "content":
+            self._log("content", val)
+            self.text.append(val)
+            return
+        ev = val
+        if ev.get("phase") == "call":
+            self._log("call", f"{'ACTION ' if ev.get('mutating') else ''}{ev.get('name')}: {_fmt_call(ev)}")
+            await self._narration()
+            if ev.get("mutating"):
                 self.actions += 1
+                await self._close_block()
                 await say(self.inc, f"⚙️ **action** `{ev.get('name')}` `{_fmt_call(ev)}`")
             else:
-                await say(self.inc, f"↳ **result** `{ev.get('name')}`: {ev.get('summary') or '(no output)'}")
+                self.reads += 1
+                await self._add_read(f"🔎 `{_fmt_call(ev)}`")
             return
-        if ev.get("phase") != "call":
-            return
-        self.reads += 1
-        self.last_read = _fmt_call(ev)
-        now = time.monotonic()
-        if now - self.last_edit < self.EDIT_EVERY_S:
-            return
-        self.last_edit = now
-        await self.render()
+        self._log("result", f"{ev.get('name')}:\n{ev.get('output') or ev.get('summary') or '(no output)'}")
+        if ev.get("mutating"):
+            await say(self.inc, f"↳ **result** `{ev.get('name')}`: {ev.get('summary') or '(no output)'}")
 
-    async def render(self) -> None:
-        if not (discord.enabled() and self.inc.thread):
+    async def _narration(self) -> None:
+        said = "".join(self.text).strip()
+        self.text = []
+        if said:
+            await self._close_block()
+            await say(self.inc, said)
+
+    async def _add_read(self, line: str) -> None:
+        if sum(len(x) + 1 for x in self.block) + len(line) > self.BLOCK_MAX:
+            await self._close_block()
+        self.block.append(line)
+        if time.monotonic() - self.last_edit >= self.EDIT_EVERY_S:
+            await self._render()
+
+    async def _render(self) -> None:
+        if not self.block or self.shown == len(self.block):
             return
-        text = f"🔎 {self.reads} read{'s' if self.reads != 1 else ''} so far · last: `{self.last_read}`"
+        self.last_edit = time.monotonic()
+        text = "\n".join(self.block)
+        if not (discord.enabled() and self.inc.thread):
+            self.shown = len(self.block)
+            return
         try:
-            if self.msg:
-                await discord.edit(self.inc.thread, self.msg, text)
+            if self.block_msg:
+                await discord.edit(self.inc.thread, self.block_msg, text)
             else:
-                self.msg = await discord.post(self.inc.thread, text)
+                self.block_msg = await discord.post(self.inc.thread, text)
         except discord.ThreadGone:
-            self.msg = None          # the line was deleted; start a new one next time
+            self.block_msg = None
+        self.shown = len(self.block)
+
+    async def _close_block(self) -> None:
+        await self._render()
+        self.block, self.block_msg, self.shown = [], None, 0
+
+    async def final(self) -> str:
+        """Close the timeline; what the model said after its last tool call."""
+        await self._close_block()
+        report = "".join(self.text).strip()
+        self.text = []
+        return report
+
+    def transcript(self, title: str) -> bytes:
+        heads = {"reasoning": "### Reasoning", "content": "### Said", "call": "### Tool call",
+                 "result": "### Tool result"}
+        parts = [f"# {title}\n"]
+        for kind, text in self.trace:
+            fence = kind in ("call", "result")
+            parts.append(f"{heads[kind]}\n" + (f"```\n{text.strip()}\n```" if fence else text.strip()) + "\n")
+        out = "\n".join(parts).encode()
+        return out[:self.TRANSCRIPT_MAX]
 
 
 async def investigate(inc: Incident, first: bool) -> None:
@@ -436,7 +510,10 @@ async def investigate(inc: Incident, first: bool) -> None:
             f"Actions appear here as they happen, and a report lands here either way.")
         progress = Progress(inc)
         try:
-            report = await ask(inc.trim(), progress)
+            full = await ask(inc.trim(), progress)
+            # The report is what came after the last tool call; the narration
+            # before it is already in the post. No tool calls: it is all report.
+            report = (await progress.final()) or full
         except Exception as exc:
             took = int(time.monotonic() - t0)
             log.exception("run failed")
@@ -456,12 +533,19 @@ async def investigate(inc: Incident, first: bool) -> None:
             return
         inc.messages.append({"role": "assistant", "content": report})
         status, shown = report_status(report)
-        if progress.reads:
-            await progress.render()
         ping = NOTIFY_USERS if status in NOTIFY_ON else []
         lead = " ".join(f"<@{u}>" for u in ping)
         await say(inc, (lead + "\n" if lead else "") + f"{shown}\n\n-# {took}s · {progress.reads} reads · "
                        f"{progress.actions} actions · mode={MODE} · status={status}", ping)
+        if inc.thread and discord.enabled():
+            n = sum(1 for m in inc.messages if m.get("role") == "assistant")
+            name = f"{inc.sha or 'run'}-{n}.md"
+            try:
+                await discord.post_file(inc.thread, "-# full record of this run: reasoning, "
+                                        "every tool call and its output", name,
+                                        progress.transcript(f"{inc.title or inc.key} · run {n}"))
+            except discord.ThreadGone:
+                pass
         await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), status)
         log.info("run done: %s in %ds", inc.name, took)
 
