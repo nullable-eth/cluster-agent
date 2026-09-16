@@ -75,6 +75,14 @@ async def post(channel_or_thread: str, text: str) -> str | None:
     return first
 
 
+async def edit(thread_id: str, message_id: str, text: str) -> None:
+    """Replace one of our messages (the live progress line)."""
+    s, _ = await call("PATCH", f"/channels/{thread_id}/messages/{message_id}",
+                      {"content": text[:LIMIT], "allowed_mentions": {"parse": []}})
+    if s == 404:
+        raise ThreadGone(thread_id)
+
+
 # Forum tags, by normalised name ("🔥 firing" and "firing" are the same tag).
 TAGS: dict[str, str] = {}
 TAG_NAMES: dict[str, str] = {}

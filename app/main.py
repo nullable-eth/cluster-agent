@@ -45,6 +45,11 @@ BRAIN_BACKOFF = [int(s) for s in E("BRAIN_BACKOFF_S", "30,60,120,240,300").split
 # How much of a thread's conversation to carry forward. The gateway compacts,
 # but sending a week of argument for every "any update?" is its own problem.
 KEEP_TURNS = int(E("KEEP_TURNS", "12"))
+# Alerts investigated at the same time. llm-expert serves 4 parallel slots,
+# shared with chat clients and agentmemory's filing, so the agent takes 2.
+# Each incident is still worked one run at a time (Incident.lock).
+WORKERS = int(E("AGENT_WORKERS", "2"))
+EMPTY_ANSWER = "(the model returned an empty answer)"
 
 
 # The playbook comes from the operator's own IaC (a mounted ConfigMap), so the
@@ -55,50 +60,90 @@ SYSTEM = prompt.build(CLUSTER, MODE, prompt.load_playbook(PLAYBOOK_PATH))
 
 
 # --------------------------------------------------------------- the brain
-async def ask(messages: list[dict], thread_id: str | None) -> str:
-    """One request to the gateway. It runs the tools and returns the report.
+class GatewayError(Exception):
+    """The gateway reported a failure inside a stream that had already started."""
 
-    Two failures, treated differently. 502/503 means the brain is NOT THERE —
-    a model rollout, where llama.cpp will not bind its port until a 29GB GGUF is
-    resident — so back off long enough to outlast one. A read timeout or a 504
-    means it is there and still thinking, and a retry would start a second loop
-    competing with the first for the same slots: fail once, say so.
+
+# The gateway sends a keepalive every 15s while tools run, so a silence this
+# long means the connection is dead, not that the model is thinking.
+STREAM_IDLE_S = int(E("STREAM_IDLE_S", "180"))
+
+
+async def _stream(body: dict, headers: dict, on_event) -> str:
+    """One streamed request. Tool events go to on_event; returns the answer."""
+    content: list[str] = []
+    timeout = httpx.Timeout(STREAM_IDLE_S, connect=15)
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        async with c.stream("POST", f"{LLM_URL}/chat/completions",
+                            headers=headers, json=body) as r:
+            if r.status_code >= 400:
+                await r.aread()
+                r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "):
+                    continue                              # keepalive comments
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except ValueError:
+                    continue
+                delta = ((obj.get("choices") or [{}])[0].get("delta")) or {}
+                ev = delta.get("tool_event")
+                if ev and on_event is not None:
+                    try:
+                        await on_event(ev)
+                    except Exception:
+                        log.exception("tool event handler failed; continuing")
+                if delta.get("content"):
+                    content.append(delta["content"])
+    text = "".join(content).strip()
+    m = GATEWAY_FAIL.search(text)
+    if m:
+        raise GatewayError(f"agent loop {m.group(1)}: {m.group(2)}")
+    return text
+
+
+GATEWAY_FAIL = re.compile(r"\[gateway: agent loop (timed out|failed): (.*)\]\s*$", re.S)
+
+
+async def ask(messages: list[dict], on_event=None) -> str:
+    """One streamed request to the gateway, which runs the tools.
+
+    Tool calls arrive as `tool_event`s while the loop works, and go to
+    on_event (the incident post shows them live). The answer is the streamed
+    content.
+
+    Two failures, treated differently. 502/503, or no connection at all, means
+    the brain is NOT THERE: a model rollout, where llama.cpp will not bind its
+    port until a 29GB GGUF is resident, so back off long enough to outlast
+    one. Anything after the stream has started means it is there and working,
+    and a retry would start a second loop competing with the first for the
+    same slots: fail once, say so.
     """
-    body = {"model": LLM_MODEL, "max_tokens": MAX_TOKENS, "messages": messages}
+    body = {"model": LLM_MODEL, "max_tokens": MAX_TOKENS, "messages": messages, "stream": True}
     headers = {"Authorization": f"Bearer {LLM_KEY}"}
-    if thread_id:
-        # Tells the gateway where to announce each mutation as it makes it, so
-        # actions appear in the incident thread rather than somewhere else.
-        headers["X-Discord-Thread"] = thread_id
     last_exc: Exception | None = None
     for attempt in range(len(BRAIN_BACKOFF) + 1):
         try:
-            async with httpx.AsyncClient(timeout=LLM_TIMEOUT_S) as c:
-                r = await c.post(f"{LLM_URL}/chat/completions", headers=headers, json=body)
-            r.raise_for_status()
-            msg = r.json()["choices"][0]["message"]
-            return (msg.get("content") or "").strip() or "(the model returned an empty answer)"
-        except httpx.TimeoutException:
-            log.warning("LLM timed out after %ds; not retrying", LLM_TIMEOUT_S)
+            text = await asyncio.wait_for(_stream(body, headers, on_event), LLM_TIMEOUT_S)
+            return text or EMPTY_ANSWER
+        except (asyncio.TimeoutError, httpx.ReadTimeout):
+            log.warning("LLM stream timed out; not retrying")
             raise
         except httpx.HTTPStatusError as exc:
             last_exc = exc
             if exc.response.status_code not in (502, 503):
                 raise
-            if attempt >= len(BRAIN_BACKOFF):
-                break
-            wait = BRAIN_BACKOFF[attempt]
-            log.warning("LLM %s (attempt %d/%d) — waiting %ds", exc.response.status_code,
-                        attempt + 1, len(BRAIN_BACKOFF) + 1, wait)
-            await asyncio.sleep(wait)
-        except httpx.TransportError as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_exc = exc
-            if attempt >= len(BRAIN_BACKOFF):
-                break
-            wait = BRAIN_BACKOFF[attempt]
-            log.warning("LLM unreachable (attempt %d/%d): %s — waiting %ds",
-                        attempt + 1, len(BRAIN_BACKOFF) + 1, exc, wait)
-            await asyncio.sleep(wait)
+        if attempt >= len(BRAIN_BACKOFF):
+            break
+        wait = BRAIN_BACKOFF[attempt]
+        log.warning("LLM unavailable (attempt %d/%d): %s — waiting %ds",
+                    attempt + 1, len(BRAIN_BACKOFF) + 1, last_exc, wait)
+        await asyncio.sleep(wait)
     raise last_exc  # type: ignore[misc]
 
 
@@ -279,7 +324,6 @@ def alert_summary(payload: dict) -> str:
     return "\n".join(lines)
 
 
-EMPTY_ANSWER = "(the model returned an empty answer)"
 # Discord's cap is 2000 per message; leave room for the fence and a little slack.
 BLOCK = 1800
 PROMPT_MAX = int(E("PROMPT_ECHO_MAX", "8000"))
@@ -314,6 +358,61 @@ async def say_block(inc: Incident, header: str, body: str, footer: str = "") -> 
         await say(inc, footer)
 
 
+def _fmt_call(ev: dict) -> str:
+    args = ev.get("args") or {}
+    if ev.get("name") == "run_kubectl" and isinstance(args.get("args"), list):
+        detail = "kubectl " + " ".join(str(a) for a in args["args"])
+    else:
+        detail = json.dumps(args, ensure_ascii=False)
+    return detail if len(detail) <= 300 else detail[:300] + "…"
+
+
+class Progress:
+    """Shows the loop's tool calls in the post as they happen.
+
+    Actions (anything that changes something) get their own messages, before
+    and after, so they are never lost in a scroll. Reads are counted in a
+    single status message that is edited in place (at most every few
+    seconds), so forty `kubectl get`s read as one line, not forty.
+    """
+    EDIT_EVERY_S = 4.0
+
+    def __init__(self, inc: "Incident"):
+        self.inc, self.reads, self.actions = inc, 0, 0
+        self.msg: str | None = None
+        self.last_edit, self.last_read = 0.0, ""
+
+    async def __call__(self, ev: dict) -> None:
+        if ev.get("mutating"):
+            if ev.get("phase") == "call":
+                self.actions += 1
+                await say(self.inc, f"⚙️ **action** `{ev.get('name')}` `{_fmt_call(ev)}`")
+            else:
+                await say(self.inc, f"↳ **result** `{ev.get('name')}`: {ev.get('summary') or '(no output)'}")
+            return
+        if ev.get("phase") != "call":
+            return
+        self.reads += 1
+        self.last_read = _fmt_call(ev)
+        now = time.monotonic()
+        if now - self.last_edit < self.EDIT_EVERY_S:
+            return
+        self.last_edit = now
+        await self.render()
+
+    async def render(self) -> None:
+        if not (discord.enabled() and self.inc.thread):
+            return
+        text = f"🔎 {self.reads} read{'s' if self.reads != 1 else ''} so far · last: `{self.last_read}`"
+        try:
+            if self.msg:
+                await discord.edit(self.inc.thread, self.msg, text)
+            else:
+                self.msg = await discord.post(self.inc.thread, text)
+        except discord.ThreadGone:
+            self.msg = None          # the line was deleted; start a new one next time
+
+
 async def investigate(inc: Incident, first: bool) -> None:
     """Run one pass, and post SOMETHING to the thread whatever happens.
 
@@ -331,8 +430,9 @@ async def investigate(inc: Incident, first: bool) -> None:
             latest_prompt(inc),
             f"Handed over, up to ~{LLM_TIMEOUT_S // 60} min of investigation allowed. "
             f"Actions appear here as they happen, and a report lands here either way.")
+        progress = Progress(inc)
         try:
-            report = await ask(inc.trim(), inc.thread)
+            report = await ask(inc.trim(), progress)
         except Exception as exc:
             took = int(time.monotonic() - t0)
             log.exception("run failed")
@@ -352,13 +452,27 @@ async def investigate(inc: Incident, first: bool) -> None:
             return
         inc.messages.append({"role": "assistant", "content": report})
         status, shown = report_status(report)
-        await say(inc, f"{shown}\n\n-# {took}s · mode={MODE} · status={status}")
+        if progress.reads:
+            await progress.render()
+        await say(inc, f"{shown}\n\n-# {took}s · {progress.reads} reads · "
+                       f"{progress.actions} actions · mode={MODE} · status={status}")
         await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), status)
         log.info("run done: %s in %ds", inc.name, took)
 
 
+KEY_LOCKS: dict[str, asyncio.Lock] = {}
+
+
 async def handle_alert(payload: dict) -> None:
     key = incident_key(payload)
+    # Two workers may get the same alert group; only one may open its post.
+    async with KEY_LOCKS.setdefault(key, asyncio.Lock()):
+        inc = await _incident_for(payload, key)
+    inc.ran_at = time.time()
+    await investigate(inc, first=True)
+
+
+async def _incident_for(payload: dict, key: str) -> Incident:
     sha = incident_sha(payload)
     labels = payload.get("groupLabels", {}) or {}
     name = labels.get("alertname", "unknown-alert")
@@ -402,9 +516,7 @@ async def handle_alert(payload: dict) -> None:
         inc.messages.append({"role": "user", "content":
                              "The same alert group fired again. Current payload:\n"
                              + json.dumps(payload, indent=1)[:6000]})
-
-    inc.ran_at = time.time()
-    await investigate(inc, first=True)
+    return inc
 
 
 # --------------------------------------------------- the operator's replies
@@ -604,7 +716,8 @@ async def worker() -> None:
 @app.on_event("startup")
 async def _start() -> None:
     global SELF_ID
-    asyncio.create_task(worker())
+    for _ in range(max(1, WORKERS)):
+        asyncio.create_task(worker())
     asyncio.create_task(poll_replies())
     if discord.enabled():
         SELF_ID = await discord.me()
@@ -639,8 +752,9 @@ async def _start() -> None:
         # member list — which is the only way to tell "watching" from "dead",
         # since both look like an empty channel.
         asyncio.create_task(gateway.run(discord.TOKEN, on_gateway_message, presence_text))
-    log.info("cluster-agent up: mode=%s llm=%s discord=%s poll=%ds timeout=%ds backoff=%s",
-             MODE, LLM_URL, "on" if discord.enabled() else "off", POLL_S, LLM_TIMEOUT_S, BRAIN_BACKOFF)
+    log.info("cluster-agent up: mode=%s llm=%s discord=%s workers=%d poll=%ds timeout=%ds backoff=%s",
+             MODE, LLM_URL, "on" if discord.enabled() else "off", WORKERS, POLL_S,
+             LLM_TIMEOUT_S, BRAIN_BACKOFF)
 
 
 @app.get("/healthz")
