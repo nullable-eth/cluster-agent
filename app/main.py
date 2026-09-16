@@ -406,13 +406,17 @@ class Progress:
         self.block_msg: str | None = None
         self.shown = 0                       # block lines already in Discord
         self.last_edit = 0.0
-        self.trace: list[tuple[str, str]] = []
+        # (kind, text, wall-clock time of its first byte)
+        self.trace: list[tuple[str, str, float]] = []
+        self.started = time.time()
+        self.first_action: float | None = None
 
     def _log(self, kind: str, text: str) -> None:
         if self.trace and self.trace[-1][0] == kind and kind in ("reasoning", "content"):
-            self.trace[-1] = (kind, self.trace[-1][1] + text)
+            k, t, ts = self.trace[-1]
+            self.trace[-1] = (k, t + text, ts)
         else:
-            self.trace.append((kind, text))
+            self.trace.append((kind, text, time.time()))
 
     async def __call__(self, kind: str, val) -> None:
         if kind == "reasoning":
@@ -428,6 +432,7 @@ class Progress:
             await self._narration()
             if ev.get("mutating"):
                 self.actions += 1
+                self.first_action = self.first_action or time.time()
                 await self._close_block()
                 await say(self.inc, f"⚙️ **action** `{ev.get('name')}` `{_fmt_call(ev)}`")
             else:
@@ -480,15 +485,56 @@ class Progress:
         self.text = []
         return report
 
-    def transcript(self, title: str) -> bytes:
-        heads = {"reasoning": "### Reasoning", "content": "### Said", "call": "### Tool call",
-                 "result": "### Tool result"}
-        parts = [f"# {title}\n"]
-        for kind, text in self.trace:
-            fence = kind in ("call", "result")
-            parts.append(f"{heads[kind]}\n" + (f"```\n{text.strip()}\n```" if fence else text.strip()) + "\n")
-        out = "\n".join(parts).encode()
-        return out[:self.TRANSCRIPT_MAX]
+    def transcript(self, title: str, prompt: str, system: str, report: str, status: str) -> bytes:
+        """The run as a standalone record: what was asked, what happened
+        when, what came of it, and the instructions the model was working to."""
+        end = time.time()
+        stamp = lambda t: time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(t))
+        clock = lambda t: time.strftime("%H:%M:%S", time.localtime(t))
+        def since(t: float) -> str:
+            d = int(t - self.started)
+            return f"+{d // 60}:{d % 60:02d}"
+        def dur(t: float) -> str:
+            d = int(t)
+            return f"{d // 60}m {d % 60:02d}s"
+        calls = [t for k, _, t in self.trace if k == "call"]
+        first_said = next((t for k, _, t in self.trace if k == "content"), None)
+        heads = {"reasoning": "Reasoning", "content": "Said", "call": "Tool call", "result": "Tool result"}
+
+        out = [f"# {title}\n",
+               "| | |", "|---|---|",
+               *([f"| Alert firing since | {fired} |"] if (fired := min(re.findall(
+                   r'"startsAt": "([0-9T:.\-]+Z)"', prompt), default="")) else []),
+               f"| Started | {stamp(self.started)} |",
+               f"| Finished | {stamp(end)} |",
+               f"| Duration | {dur(end - self.started)} |",
+               f"| Status | {status} |",
+               f"| Tool calls | {self.reads} reads, {self.actions} actions |",
+               f"| Model / mode | {LLM_MODEL} / {MODE} |", "",
+               "## Prompt\n", "```", prompt.strip(), "```", "",
+               "## Timeline\n"]
+        for kind, text, ts in self.trace:
+            body = text.strip()
+            if not body:
+                continue
+            out.append(f"### {clock(ts)} ({since(ts)}) · {heads[kind]}")
+            out.append(f"```\n{body}\n```\n" if kind in ("call", "result") else body + "\n")
+        out += ["## Summary\n",
+                "| Step | Time | Since start |", "|---|---|---|",
+                f"| Started | {clock(self.started)} | +0:00 |"]
+        if first_said:
+            out.append(f"| First words | {clock(first_said)} | {since(first_said)} |")
+        if calls:
+            out.append(f"| First tool call | {clock(calls[0])} | {since(calls[0])} |")
+        if self.first_action:
+            out.append(f"| First action | {clock(self.first_action)} | {since(self.first_action)} |")
+        if calls:
+            out.append(f"| Last tool call | {clock(calls[-1])} | {since(calls[-1])} |")
+        out += [f"| Finished | {clock(end)} | {since(end)} |", "",
+                "## Report\n", report.strip() or "(none)", "",
+                "## Appendix: system prompt\n", "```", system.strip(), "```", ""]
+        data = "\n".join(out).encode()
+        return data[:self.TRANSCRIPT_MAX]
 
 
 async def investigate(inc: Incident, first: bool) -> None:
@@ -509,6 +555,11 @@ async def investigate(inc: Incident, first: bool) -> None:
             f"Handed over, up to ~{LLM_TIMEOUT_S // 60} min of investigation allowed. "
             f"Actions appear here as they happen, and a report lands here either way.")
         progress = Progress(inc)
+        prompt = latest_prompt(inc)
+        first = next((m.get("content") or "" for m in inc.messages if m.get("role") == "user"), "")
+        if first and first != prompt:
+            # A later run (an operator reply): keep the record self-contained.
+            prompt = f"{first}\n\n--- this run was started by ---\n{prompt}"
         try:
             full = await ask(inc.trim(), progress)
             # The report is what came after the last tool call; the narration
@@ -540,10 +591,12 @@ async def investigate(inc: Incident, first: bool) -> None:
         if inc.thread and discord.enabled():
             n = sum(1 for m in inc.messages if m.get("role") == "assistant")
             name = f"{inc.sha or 'run'}-{n}.md"
+            system = next((m.get("content") or "" for m in inc.messages if m.get("role") == "system"), "")
+            record = progress.transcript(f"{inc.title or inc.key} · run {n}", prompt, system,
+                                         shown, status)
             try:
-                await discord.post_file(inc.thread, "-# full record of this run: reasoning, "
-                                        "every tool call and its output", name,
-                                        progress.transcript(f"{inc.title or inc.key} · run {n}"))
+                await discord.post_file(inc.thread, "-# full record of this run: prompt, timeline "
+                                        "with times, every tool call and its output", name, record)
             except discord.ThreadGone:
                 pass
         await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), status)
