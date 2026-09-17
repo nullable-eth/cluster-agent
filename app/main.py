@@ -136,7 +136,10 @@ async def ask(messages: list[dict], on_event=None) -> str:
     same slots: fail once, say so.
     """
     body = {"model": LLM_MODEL, "max_tokens": MAX_TOKENS, "messages": messages, "stream": True}
-    headers = {"Authorization": f"Bearer {LLM_KEY}"}
+    # Detached: the gateway cancels a run when its client hangs up, except
+    # when asked not to. An incident run must finish (and its actions stay
+    # consistent) even if this pod restarts mid-run.
+    headers = {"Authorization": f"Bearer {LLM_KEY}", "X-Run-Detached": "1"}
     last_exc: Exception | None = None
     for attempt in range(len(BRAIN_BACKOFF) + 1):
         try:
