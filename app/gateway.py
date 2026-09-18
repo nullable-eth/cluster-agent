@@ -41,8 +41,9 @@ def status() -> str:
 
 
 class _Session:
-    def __init__(self, token: str, on_message, presence):
+    def __init__(self, token: str, on_message, presence, on_delete=None):
         self.token, self.on_message, self.presence = token, on_message, presence
+        self.on_delete = on_delete
         self.seq = None
         self.session_id = None
         self.resume_url = None
@@ -136,6 +137,17 @@ class _Session:
                                 await self.on_message(msg["d"])
                             except Exception:
                                 log.exception("message handler failed")
+                        elif t in ("THREAD_DELETE", "CHANNEL_DELETE"):
+                            # These already arrived — the GUILDS intent asks for
+                            # them — and were being dropped on the floor, so a
+                            # deleted post was only noticed lazily, on the next
+                            # 404. Deleting a post is an explicit "stop", and it
+                            # should take effect when it is made.
+                            if self.on_delete:
+                                try:
+                                    await self.on_delete(msg["d"])
+                                except Exception:
+                                    log.exception("delete handler failed")
             finally:
                 beat.cancel()
                 _state["connected"] = False
@@ -154,10 +166,10 @@ async def set_presence(text: str) -> None:
             log.warning("presence update failed: %s", exc)
 
 
-async def run(token: str, on_message, presence) -> None:
+async def run(token: str, on_message, presence, on_delete=None) -> None:
     """Stay connected. Forever, through anything."""
     global _current
-    sess = _Session(token, on_message, presence)
+    sess = _Session(token, on_message, presence, on_delete)
     _current = sess
     backoff = 1
     while True:
