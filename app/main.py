@@ -181,9 +181,10 @@ class Incident:
         # at that point so the next firing anchors its own thread, but stays
         # watched for replies until the watched set needs the room.
         self.resolved: bool = False
-        # False for a thread adopted at startup: we hold the routing but not
-        # the conversation, so the first reply pulls the history back out of
-        # Discord instead of answering "I don't have the earlier thread".
+        # True for anything built from a live payload or read back out of
+        # Discord. Kept as a guard: an Incident carrying routing but no
+        # conversation must pull its history before answering, rather than
+        # replying "I don't have the earlier thread" while it sits in the post.
         self.hydrated: bool = True
         self.lock = asyncio.Lock()
         # Replies arrive twice by design — once down the socket, once from the
@@ -745,10 +746,11 @@ async def on_gateway_message(d: dict) -> None:
         return
     inc, rebuilt = BY_THREAD.get(cid), None
     if inc is None or not inc.hydrated:
-        # Either a thread nobody is watching any more — resolved and aged out,
-        # or from before a restart — or one adopted for routing with no
-        # conversation behind it. Read it back out of Discord rather than
-        # ignoring the question or answering without the context.
+        # A post the agent is not holding: resolved and evicted from the
+        # cache, or from before a restart, or simply one it has never seen.
+        # This is the normal path now that Discord is the registry — read the
+        # conversation back out of the post rather than ignoring the question
+        # or answering without its context.
         try:
             rebuilt = await rehydrate(cid)
         except discord.ThreadGone:
@@ -777,21 +779,56 @@ WATCH_MAX = int(E("WATCH_MAX_THREADS", "25"))
 
 
 def retire_watched() -> None:
-    """Keep watching resolved threads for replies, but not without limit.
+    """Bound the cache. Nothing here is authoritative, so dropping is cheap.
 
-    A resolved incident leaves INCIDENTS (so the next firing gets its own
-    thread) yet stays in BY_THREAD, because an operator may well come back and
-    ask about it afterwards. That set would otherwise grow for the life of the
-    process, so the oldest resolved ones are dropped once it gets long. Live
-    incidents are never dropped.
+    BY_THREAD is a CACHE, not a registry: Discord holds the conversation, and
+    rehydrate() rebuilds any post from it the moment someone writes in that
+    post again. So the only cost of evicting is one extra read later. Oldest
+    first, and never one that is mid-investigation — that object is live and a
+    reply arriving after eviction would rebuild a second Incident for the same
+    post while the first is still working.
     """
     while len(BY_THREAD) > WATCH_MAX:
-        for tid, inc in BY_THREAD.items():          # insertion-ordered: oldest first
-            if inc.resolved:
+        for tid, inc in list(BY_THREAD.items()):    # insertion-ordered: oldest first
+            if not inc.lock.locked():
                 BY_THREAD.pop(tid, None)
                 break
         else:
-            return                                   # nothing resolved left to drop
+            return                                  # every cached post is busy
+
+
+async def on_gateway_delete(d: dict) -> None:
+    """A post (or the whole forum) was deleted in Discord. Stop watching it.
+
+    Deleting a post is the operator saying "drop this". Until now that was only
+    noticed lazily, on the next 404, so the agent kept polling an id nobody
+    could read.
+
+    This does NOT stop an investigation that is already running. Cancelling a
+    tool loop mid-flight can leave a half-applied mutation on the cluster, which
+    is worse than a wasted run: the run finishes, and its report simply has
+    nowhere to go (say() finds the post gone and drops it).
+    """
+    gone = str(d.get("id") or "")
+    if not gone:
+        return
+    if gone == discord.CHANNEL:
+        # The forum itself. Every post in it went with it.
+        n = len(BY_THREAD)
+        BY_THREAD.clear()
+        INCIDENTS.clear()
+        log.warning("forum channel %s deleted; stopped watching all %d post(s)", gone, n)
+        return
+    inc = BY_THREAD.get(gone)
+    if inc is not None:
+        forget(inc)
+    else:
+        # Not cached — evict any alert still routed at it, so the next firing
+        # opens a fresh post instead of writing into a deleted one.
+        for k, i in list(INCIDENTS.items()):
+            if i.thread == gone:
+                INCIDENTS.pop(k, None)
+                log.info("post %s deleted; %s will open a new one if it fires again", gone, k)
 
 
 def forget(inc: Incident) -> None:
@@ -870,34 +907,28 @@ async def _start() -> None:
         if SELF_ID:
             discord.remember_self(SELF_ID)   # lets history() tell our voice from theirs
         await discord.load_tags()
-        # Re-adopt the threads we were already in, so a restart does not strand
-        # a conversation mid-incident. Their history is gone; the thread is not.
-        for t in await discord.active_threads():
-            # The thread title is the incident key plus this firing's sha, so
-            # adoption restores routing as well as the conversation: a RESOLVED
-            # arriving after a restart lands in its own thread instead of loose
-            # in the channel. The sha is stripped back off to recover the key.
-            title = (t.get("name") or "").strip()
-            sha = sha_from_title(title)
-            key = title.rsplit(THREAD_SEP, 1)[0] if sha else title
-            inc = Incident(key or f"adopted:{t['id']}",
-                           key.split(THREAD_SEP)[0] or "incident", t["id"])
-            inc.sha = sha
-            inc.title = title
-            inc.tags = discord.tag_names(t.get("applied_tags"))
-            # Routing only. The conversation is left empty and hydrated=False:
-            # the first reply reads the thread back out of Discord, so a
-            # question after a restart is answered with the real history rather
-            # than an apology for not having it.
-            inc.hydrated = False
-            inc.messages = [{"role": "system", "content": SYSTEM}]
-            INCIDENTS[inc.key] = inc
-            BY_THREAD[t["id"]] = inc
-        log.info("adopted %d open post(s)", len(BY_THREAD))
+        # No adoption sweep. The agent used to bulk-load every open post at
+        # startup to keep routing alive across a restart; that made memory the
+        # registry, grew with the channel, and meant a finished post had to be
+        # ARCHIVED to stay out of the sweep — which in a forum means closing it,
+        # burying it under "Older Posts" however recent its activity.
+        #
+        # Discord is the registry instead. The socket delivers every message in
+        # the forum, and the first one for a post the agent is not holding
+        # rebuilds it from the post itself (rehydrate). So a follow-up on a
+        # week-old resolved incident works, nothing is held that nobody is
+        # talking about, and there is no sweep to hide from.
+        #
+        # The one thing lost: after a restart, an alert that is STILL firing has
+        # no in-memory route to its open post, so a re-fire opens a second post.
+        # That is a duplicate, not a mismatch. Recovering the route would mean
+        # matching posts by title, which is exactly how an investigation ends up
+        # in the wrong place. Duplicates are safe; mismatches are not.
         # The socket: replies land instantly, and the bot shows as online in the
         # member list — which is the only way to tell "watching" from "dead",
         # since both look like an empty channel.
-        asyncio.create_task(gateway.run(discord.TOKEN, on_gateway_message, presence_text))
+        asyncio.create_task(gateway.run(discord.TOKEN, on_gateway_message,
+                                        presence_text, on_gateway_delete))
     log.info("cluster-agent up: mode=%s llm=%s discord=%s workers=%d poll=%ds timeout=%ds backoff=%s",
              MODE, LLM_URL, "on" if discord.enabled() else "off", WORKERS, POLL_S,
              LLM_TIMEOUT_S, BRAIN_BACKOFF)
@@ -932,8 +963,15 @@ async def alert(req: Request) -> dict:
         # own post instead of appending to this one.
         INCIDENTS.pop(key, None)
         if inc.thread:
+            # Tag it and LEAVE IT OPEN. Archiving used to close the post here,
+            # purely so the startup sweep would not re-adopt it — and that sweep
+            # is gone. In a forum, archiving means closing: Discord buckets
+            # closed posts under "Older Posts" and sorts by recency only WITHIN
+            # each bucket, so a post resolved a minute ago sank below ones a day
+            # old. The `resolved` tag says the same thing without hiding it, and
+            # an open post is one you can still add to when the agent called it
+            # resolved and you know better.
             await tag(inc, "resolved", *(["fixed"] if "fixed" in inc.tags else []))
-            await discord.archive_thread(inc.thread)
         retire_watched()
         return {"queued": False, "reason": "resolved"}
 
