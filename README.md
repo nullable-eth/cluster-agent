@@ -33,6 +33,7 @@ on-LAN; the Discord audit trail is fire-and-forget and never blocks.
 | `DISCORD_NOTIFY_USERS` | *(empty)* | Comma-separated Discord user ids to @mention when a report ends in a `DISCORD_NOTIFY_ON` status. Empty: never pings anyone |
 | `DISCORD_NOTIFY_ON` | `awaiting-reply` | Comma-separated statuses that ping `DISCORD_NOTIFY_USERS` |
 | `AGENT_WORKERS` | `2` | Alerts investigated in parallel (one run per incident at a time) |
+| `ALERTMANAGER_URL` | *(empty)* | Alertmanager base URL (e.g. `http://alertmanager:9093`). When set, a queued firing is checked against `/api/v2/alerts` just before it is worked, and skipped — no post, no run — if its group is no longer active (resolved, silenced or inhibited while it waited). Unreachable or unset: the firing is worked as before |
 | `HA_URL` / `HA_TOKEN` | *(empty)* | Home Assistant; empty disables HA tools |
 | `MEMORY_URL` / `MEMORY_READ_TOKEN` | *(empty)* | agentmemory `/search`; empty disables |
 | `PROTECTED` | `cluster-agent` | Comma list of self-preservation targets |
