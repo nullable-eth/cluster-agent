@@ -5,7 +5,7 @@ alert is seen even if this process is dead) AND webhooks this process. The
 agent opens a post for it in the #agent-actions forum and works there: the
 alert, its report, its actions (announced by the gateway as they run), the
 operator's replies from a phone, and Prometheus's own RESOLVED, one post per
-incident. Tags on the post show where it stands; a resolved post is archived.
+incident. Tags on the post show where it stands; a resolved post stays open.
 
 This process owns no tools and holds no cluster credentials. The tool loop,
 kubectl, Home Assistant, memory and silences all live in the gateway behind
@@ -54,6 +54,9 @@ EMPTY_ANSWER = "(the model returned an empty answer)"
 # operator's phone rings when the agent is waiting on them. Empty: no pings.
 NOTIFY_USERS = [u.strip() for u in E("DISCORD_NOTIFY_USERS", "").split(",") if u.strip()]
 NOTIFY_ON = {s.strip() for s in E("DISCORD_NOTIFY_ON", "awaiting-reply").split(",") if s.strip()}
+# Alertmanager's API (e.g. http://alertmanager:9093). When set, a queued firing
+# is checked against it before any post is opened; unset, the check is skipped.
+ALERTMANAGER_URL = E("ALERTMANAGER_URL", "").rstrip("/")
 
 
 # The playbook comes from the operator's own IaC (a mounted ConfigMap), so the
@@ -610,8 +613,58 @@ async def investigate(inc: Incident, first: bool) -> None:
 KEY_LOCKS: dict[str, asyncio.Lock] = {}
 
 
+async def still_active(payload: dict) -> bool | None:
+    """Is anything in this alert group still firing, per Alertmanager, now?
+
+    A firing waits in QUEUE; a resolve is handled on arrival. So when the
+    agent is down, busy or catching up on retries, the resolve can overtake
+    the firing: it finds no post and is dropped, then the stale firing opens a
+    post that nothing will ever resolve. Asking Alertmanager at the moment of
+    acting closes that race whatever the order of arrival.
+
+    "Active" means firing and neither silenced nor inhibited, so a silence set
+    while the firing sat in the queue (a planned maintenance, a bench) is
+    respected too.
+
+    Matches on the GROUP labels, not the payload's fingerprints: the group is
+    the incident, and an alert that joined it after this payload still counts.
+    None means the answer is unknown (no URL, or Alertmanager unreachable);
+    the caller treats that as firing, because a spurious investigation costs
+    minutes while a skipped real one costs the incident.
+    """
+    if not ALERTMANAGER_URL:
+        return None
+    labels = payload.get("groupLabels") or {}
+    if not labels:
+        return None
+    params = [("active", "true"), ("silenced", "false"), ("inhibited", "false"),
+              ("unprocessed", "false")]
+    params += [("filter", f'{k}={json.dumps(str(v))}') for k, v in sorted(labels.items())]
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{ALERTMANAGER_URL}/api/v2/alerts", params=params)
+            r.raise_for_status()
+            alerts = r.json()
+    except Exception as exc:
+        log.warning("alertmanager check failed for %s (%s); assuming still firing",
+                    labels.get("alertname"), exc)
+        return None
+    return any((a.get("status") or {}).get("state") == "active" for a in alerts)
+
+
 async def handle_alert(payload: dict) -> None:
     key = incident_key(payload)
+    if await still_active(payload) is False:
+        # Nothing to investigate: the alert cleared (or was silenced) while
+        # this firing waited. No new post — #cluster-alerts already has both
+        # halves. If a post for this group IS open, note it there and
+        # leave it to the resolve that closes it.
+        inc = INCIDENTS.get(key)
+        log.info("skipping %s (%s): no longer active in Alertmanager", key, incident_sha(payload))
+        if inc is not None and inc.thread:
+            await say(inc, "-# a queued re-fire was dropped: Alertmanager no longer "
+                           "shows this alert as active.")
+        return
     # Two workers may get the same alert group; only one may open its post.
     async with KEY_LOCKS.setdefault(key, asyncio.Lock()):
         inc = await _incident_for(payload, key)
