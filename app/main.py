@@ -29,15 +29,19 @@ LLM_URL   = E("LLM_URL", "http://llm:8000/v1")   # the gateway, not a model serv
 LLM_MODEL = E("LLM_MODEL", "default")
 LLM_KEY   = E("LLM_API_KEY", "")
 MODE      = E("MODE", "propose")            # reported in the prompt; enforced in the gateway
-MAX_TOKENS = int(E("LLM_MAX_TOKENS", "4000"))
+# Tokens per model step, reasoning included. 0 (the default) sends no cap: the
+# model thinks and writes for as long as a step needs, and the gateway's
+# compaction keeps the conversation inside the window. A cap here is what cut
+# the 2026-09-26 run off mid-thought.
+MAX_TOKENS = int(E("LLM_MAX_TOKENS", "0"))
 COOLDOWN  = int(E("COOLDOWN_S", "900"))
 POLL_S    = int(E("REPLY_POLL_S", "15"))
-# How long to let the model work. Generous on purpose: a run that dies at 5
-# minutes saying it could not determine anything is worse than one that spends
-# 20 and fixes it. This MUST stay above the gateway's own worst case
-# (REQUEST_MAX_SECONDS + ANSWER_TIMEOUT_S), or the agent hangs up on work that
-# was about to finish and reports a timeout for a run that succeeded.
-LLM_TIMEOUT_S = int(E("LLM_TIMEOUT_S", "1800"))
+# How long to let the model work. 0 (the default) is no limit: a run ends when
+# it is done. A dead connection is still caught (STREAM_IDLE_S), and a hung
+# model or a looping run is caught in the gateway and reported in-band. If set,
+# it MUST stay above any deadline configured in the gateway, or the agent hangs
+# up on work that was about to finish.
+LLM_TIMEOUT_S = int(E("LLM_TIMEOUT_S", "0"))
 # Waits between attempts when the brain is unreachable. Sized to outlast an
 # llm-expert rollout (~12 min: pod restart plus a 29GB GGUF load before
 # llama.cpp binds its port), not to be polite about a blip.
@@ -138,7 +142,9 @@ async def ask(messages: list[dict], on_event=None) -> str:
     and a retry would start a second loop competing with the first for the
     same slots: fail once, say so.
     """
-    body = {"model": LLM_MODEL, "max_tokens": MAX_TOKENS, "messages": messages, "stream": True}
+    body = {"model": LLM_MODEL, "messages": messages, "stream": True}
+    if MAX_TOKENS > 0:
+        body["max_tokens"] = MAX_TOKENS
     # Detached: the gateway cancels a run when its client hangs up, except
     # when asked not to. An incident run must finish (and its actions stay
     # consistent) even if this pod restarts mid-run.
@@ -146,7 +152,8 @@ async def ask(messages: list[dict], on_event=None) -> str:
     last_exc: Exception | None = None
     for attempt in range(len(BRAIN_BACKOFF) + 1):
         try:
-            text = await asyncio.wait_for(_stream(body, headers, on_event), LLM_TIMEOUT_S)
+            run = _stream(body, headers, on_event)
+            text = await (asyncio.wait_for(run, LLM_TIMEOUT_S) if LLM_TIMEOUT_S > 0 else run)
             return text or EMPTY_ANSWER
         except (asyncio.TimeoutError, httpx.ReadTimeout):
             log.warning("LLM stream timed out; not retrying")
@@ -544,6 +551,28 @@ class Progress:
         return data[:self.TRANSCRIPT_MAX]
 
 
+async def attach_record(inc: Incident, progress: "Progress", prompt: str, shown: str,
+                        status: str, failed: bool = False) -> None:
+    """The run's full record as an .md on the post: prompt, timeline with
+    times, every tool call and its output. Attached for failed runs too — a
+    run that died after acting is exactly the one whose record matters."""
+    if not (inc.thread and discord.enabled()):
+        return
+    # A failed run adds no assistant turn, so it is numbered as the next one.
+    n = sum(1 for m in inc.messages if m.get("role") == "assistant") + int(failed)
+    name = f"{inc.sha or 'run'}-{n}.md"
+    system = next((m.get("content") or "" for m in inc.messages if m.get("role") == "system"), "")
+    try:
+        record = progress.transcript(f"{inc.title or inc.key} · run {n}", prompt, system,
+                                     shown, status)
+        await discord.post_file(inc.thread, "-# full record of this run: prompt, timeline "
+                                "with times, every tool call and its output", name, record)
+    except discord.ThreadGone:
+        pass
+    except Exception:
+        log.exception("could not attach the run record")
+
+
 async def investigate(inc: Incident, first: bool) -> None:
     """Run one pass, and post SOMETHING to the thread whatever happens.
 
@@ -559,8 +588,9 @@ async def investigate(inc: Incident, first: bool) -> None:
             inc,
             f"🧵 **ThreadID** `{inc.sha or '········'}` — prompt sent to the model:",
             latest_prompt(inc),
-            f"Handed over, up to ~{LLM_TIMEOUT_S // 60} min of investigation allowed. "
-            f"Actions appear here as they happen, and a report lands here either way.")
+            (f"Handed over, up to ~{LLM_TIMEOUT_S // 60} min of investigation allowed. "
+             if LLM_TIMEOUT_S > 0 else "Handed over, no time limit: it works until it is done. ")
+            + "Actions appear here as they happen, and a report lands here either way.")
         progress = Progress(inc)
         prompt = latest_prompt(inc)
         first = next((m.get("content") or "" for m in inc.messages if m.get("role") == "user"), "")
@@ -576,17 +606,29 @@ async def investigate(inc: Incident, first: bool) -> None:
             took = int(time.monotonic() - t0)
             log.exception("run failed")
             # The alert is already in the channel, so the absence of a report
-            # has to be explained where the alert is.
-            await say(inc, f"❌ **No report — the model never answered** (after {took}s).\n"
-                           f"`{type(exc).__name__}: {exc}`\n"
-                           f"Nothing was changed and the alert stands. Reply here to retry.")
+            # has to be explained where the alert is — truthfully: a run that
+            # fails late may already have acted, and saying "nothing was
+            # changed" after a restart or a push would be the worst lie here.
+            changed = (f"**{progress.actions} action(s) were taken before it failed** — they are "
+                       f"in the timeline above and in the attached record."
+                       if progress.actions else "Nothing was changed.")
+            shown = (f"❌ **No report — the run failed** (after {took}s, "
+                     f"{progress.reads} reads, {progress.actions} actions).\n"
+                     f"`{type(exc).__name__}: {exc}`\n"
+                     f"{changed} The alert stands. Reply here to retry.")
+            await say(inc, shown, NOTIFY_USERS if "operator-needed" in NOTIFY_ON else [])
+            await attach_record(inc, progress, prompt, shown, "operator-needed", failed=True)
             await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), "operator-needed")
             return
         took = int(time.monotonic() - t0)
         if not report.strip() or report.strip() == EMPTY_ANSWER:
             log.warning("empty report for %s after %ds", inc.name, took)
-            await say(inc, f"❌ **No report — the model answered with nothing** (after {took}s). "
-                           f"Nothing was changed. Reply here to make it try again.")
+            changed = (f"**{progress.actions} action(s) were taken** — see the timeline above "
+                       f"and the attached record." if progress.actions else "Nothing was changed.")
+            shown = (f"❌ **No report — the model answered with nothing** (after {took}s). "
+                     f"{changed} Reply here to make it try again.")
+            await say(inc, shown, NOTIFY_USERS if "operator-needed" in NOTIFY_ON else [])
+            await attach_record(inc, progress, prompt, shown, "operator-needed", failed=True)
             await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), "operator-needed")
             return
         inc.messages.append({"role": "assistant", "content": report})
@@ -595,17 +637,7 @@ async def investigate(inc: Incident, first: bool) -> None:
         lead = " ".join(f"<@{u}>" for u in ping)
         await say(inc, (lead + "\n" if lead else "") + f"{shown}\n\n-# {took}s · {progress.reads} reads · "
                        f"{progress.actions} actions · mode={MODE} · status={status}", ping)
-        if inc.thread and discord.enabled():
-            n = sum(1 for m in inc.messages if m.get("role") == "assistant")
-            name = f"{inc.sha or 'run'}-{n}.md"
-            system = next((m.get("content") or "" for m in inc.messages if m.get("role") == "system"), "")
-            record = progress.transcript(f"{inc.title or inc.key} · run {n}", prompt, system,
-                                         shown, status)
-            try:
-                await discord.post_file(inc.thread, "-# full record of this run: prompt, timeline "
-                                        "with times, every tool call and its output", name, record)
-            except discord.ThreadGone:
-                pass
+        await attach_record(inc, progress, prompt, shown, status)
         await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), status)
         log.info("run done: %s in %ds", inc.name, took)
 
