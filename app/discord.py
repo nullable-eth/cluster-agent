@@ -142,13 +142,15 @@ def tag_names(ids) -> set[str]:
     return {TAG_NAMES[i] for i in (ids or []) if i in TAG_NAMES}
 
 
-async def create_post(title: str, text: str, tags) -> str | None:
-    """Open a forum post. Returns its id (a thread id), or None."""
+async def create_post(title: str, text: str, tags, mention: list[str] | None = None) -> str | None:
+    """Open a forum post. Returns its id (a thread id), or None. As with
+    post(), only the user ids in `mention` can be pinged by the text."""
     s, body = await call("POST", f"/channels/{CHANNEL}/threads", {
         "name": title[:100],
         "auto_archive_duration": AUTO_ARCHIVE_MIN,
         "applied_tags": tag_ids(tags),
-        "message": {"content": text[:LIMIT], "allowed_mentions": {"parse": []}},
+        "message": {"content": text[:LIMIT],
+                    "allowed_mentions": {"parse": [], "users": list(mention or [])[:100]}},
     })
     if s not in (200, 201) or not body:
         log.warning("post create failed %s: %s", s, str(body)[:200])
