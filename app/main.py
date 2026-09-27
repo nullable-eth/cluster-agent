@@ -57,7 +57,20 @@ EMPTY_ANSWER = "(the model returned an empty answer)"
 # Discord user ids to @mention when a report ends in one of NOTIFY_ON, so the
 # operator's phone rings when the agent is waiting on them. Empty: no pings.
 NOTIFY_USERS = [u.strip() for u in E("DISCORD_NOTIFY_USERS", "").split(",") if u.strip()]
+# Report statuses that ping; "*" pings on every report. A failed run and the
+# agent's own notices ("NOT investigated") count as operator-needed.
 NOTIFY_ON = {s.strip() for s in E("DISCORD_NOTIFY_ON", "awaiting-reply").split(",") if s.strip()}
+
+
+def pings(status: str) -> list[str]:
+    """Who to @mention for a post ending in `status`."""
+    return NOTIFY_USERS if ("*" in NOTIFY_ON or status in NOTIFY_ON) else []
+
+
+def with_pings(text: str, users: list[str]) -> str:
+    """Discord only pings a user whose <@id> is in the text AND in
+    allowed_mentions; say() sets the second, this the first."""
+    return (" ".join(f"<@{u}>" for u in users) + "\n" + text) if users else text
 # Alertmanager's API (e.g. http://alertmanager:9093). When set, a queued firing
 # is checked against it before any post is opened; unset, the check is skipped.
 ALERTMANAGER_URL = E("ALERTMANAGER_URL", "").rstrip("/")
@@ -282,8 +295,11 @@ async def say(inc: Incident | None, text: str, mention: list[str] | None = None)
         return
     if inc is None:
         # Not about one incident (the agent itself failing): its own post, so
-        # it is seen and not lost in an unrelated incident.
-        await discord.create_post("cluster-agent · notice", text, ["operator-needed"])
+        # it is seen and not lost in an unrelated incident. Operator-needed by
+        # definition, so it pings like any other operator-needed report.
+        users = pings("operator-needed")
+        await discord.create_post("cluster-agent · notice", with_pings(text, users),
+                                  ["operator-needed"], users)
         return
     if inc.thread:
         try:
@@ -295,7 +311,7 @@ async def say(inc: Incident | None, text: str, mention: list[str] | None = None)
     # talking into a post nobody can see.
     inc.thread = await discord.create_post(
         inc.title or inc.key, "-# the earlier post for this incident is gone; continuing here.\n" + text,
-        inc.tags or ["firing"])
+        inc.tags or ["firing"], mention)
     if inc.thread:
         BY_THREAD[inc.thread] = inc
         if not inc.resolved:
@@ -616,7 +632,8 @@ async def investigate(inc: Incident, first: bool) -> None:
                      f"{progress.reads} reads, {progress.actions} actions).\n"
                      f"`{type(exc).__name__}: {exc}`\n"
                      f"{changed} The alert stands. Reply here to retry.")
-            await say(inc, shown, NOTIFY_USERS if "operator-needed" in NOTIFY_ON else [])
+            users = pings("operator-needed")
+            await say(inc, with_pings(shown, users), users)
             await attach_record(inc, progress, prompt, shown, "operator-needed", failed=True)
             await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), "operator-needed")
             return
@@ -627,16 +644,17 @@ async def investigate(inc: Incident, first: bool) -> None:
                        f"and the attached record." if progress.actions else "Nothing was changed.")
             shown = (f"❌ **No report — the model answered with nothing** (after {took}s). "
                      f"{changed} Reply here to make it try again.")
-            await say(inc, shown, NOTIFY_USERS if "operator-needed" in NOTIFY_ON else [])
+            users = pings("operator-needed")
+            await say(inc, with_pings(shown, users), users)
             await attach_record(inc, progress, prompt, shown, "operator-needed", failed=True)
             await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), "operator-needed")
             return
         inc.messages.append({"role": "assistant", "content": report})
         status, shown = report_status(report)
-        ping = NOTIFY_USERS if status in NOTIFY_ON else []
-        lead = " ".join(f"<@{u}>" for u in ping)
-        await say(inc, (lead + "\n" if lead else "") + f"{shown}\n\n-# {took}s · {progress.reads} reads · "
-                       f"{progress.actions} actions · mode={MODE} · status={status}", ping)
+        ping = pings(status)
+        await say(inc, with_pings(f"{shown}\n\n-# {took}s · {progress.reads} reads · "
+                                  f"{progress.actions} actions · mode={MODE} · status={status}",
+                                  ping), ping)
         await attach_record(inc, progress, prompt, shown, status)
         await tag(inc, *(["resolved"] if inc.resolved else ["firing"]), status)
         log.info("run done: %s in %ds", inc.name, took)
