@@ -663,33 +663,30 @@ async def investigate(inc: Incident, first: bool) -> None:
 KEY_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-async def still_active(payload: dict) -> bool | None:
-    """Is anything in this alert group still firing, per Alertmanager, now?
+async def alert_state(payload: dict) -> str | None:
+    """Where this alert group stands in Alertmanager, now: "active",
+    "suppressed" (silenced or inhibited) or "cleared" (nothing left).
 
-    A firing waits in QUEUE; a resolve is handled on arrival. So when the
-    agent is down, busy or catching up on retries, the resolve can overtake
-    the firing: it finds no post and is dropped, then the stale firing opens a
-    post that nothing will ever resolve. Asking Alertmanager at the moment of
-    acting closes that race whatever the order of arrival.
-
-    "Active" means firing and neither silenced nor inhibited, so a silence set
-    while the firing sat in the queue (a planned maintenance, a bench) is
-    respected too.
+    Asked at the moment of acting, because a firing waits in QUEUE while a
+    resolve is handled on arrival, so the two can arrive in either order.
+    Only "suppressed" means skip: a silence set while the firing waited (a
+    planned maintenance, a bench) is respected. "cleared" is still
+    investigated — an alert that fired and stopped still happened, and a
+    30-second PodEgressSpike on 2026-09-28 was skipped, leaving an alert in
+    #cluster-alerts that looked like the agent was down.
 
     Matches on the GROUP labels, not the payload's fingerprints: the group is
     the incident, and an alert that joined it after this payload still counts.
     None means the answer is unknown (no URL, or Alertmanager unreachable);
-    the caller treats that as firing, because a spurious investigation costs
-    minutes while a skipped real one costs the incident.
+    the caller treats that as active.
     """
     if not ALERTMANAGER_URL:
         return None
     labels = payload.get("groupLabels") or {}
     if not labels:
         return None
-    params = [("active", "true"), ("silenced", "false"), ("inhibited", "false"),
-              ("unprocessed", "false")]
-    params += [("filter", f'{k}={json.dumps(str(v))}') for k, v in sorted(labels.items())]
+    # Every state (the API's defaults): active, silenced, inhibited, unprocessed.
+    params = [("filter", f'{k}={json.dumps(str(v))}') for k, v in sorted(labels.items())]
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(f"{ALERTMANAGER_URL}/api/v2/alerts", params=params)
@@ -699,27 +696,48 @@ async def still_active(payload: dict) -> bool | None:
         log.warning("alertmanager check failed for %s (%s); assuming still firing",
                     labels.get("alertname"), exc)
         return None
-    return any((a.get("status") or {}).get("state") == "active" for a in alerts)
+    states = {(a.get("status") or {}).get("state") for a in alerts}
+    if states & {"active", "unprocessed"}:
+        return "active"
+    if "suppressed" in states:
+        return "suppressed"
+    return "cleared"
 
 
 async def handle_alert(payload: dict) -> None:
     key = incident_key(payload)
-    if await still_active(payload) is False:
-        # Nothing to investigate: the alert cleared (or was silenced) while
-        # this firing waited. No new post — #cluster-alerts already has both
-        # halves. If a post for this group IS open, note it there and
-        # leave it to the resolve that closes it.
+    state = await alert_state(payload)
+    if state == "suppressed":
+        # Silenced or inhibited while this firing waited: someone decided not
+        # to hear about it. No new post — #cluster-alerts already has it.
         inc = INCIDENTS.get(key)
-        log.info("skipping %s (%s): no longer active in Alertmanager", key, incident_sha(payload))
+        log.info("skipping %s (%s): silenced or inhibited in Alertmanager", key,
+                 incident_sha(payload))
         if inc is not None and inc.thread:
-            await say(inc, "-# a queued re-fire was dropped: Alertmanager no longer "
-                           "shows this alert as active.")
+            await say(inc, "-# a queued re-fire was dropped: Alertmanager shows this "
+                           "alert as silenced or inhibited.")
         return
     # Two workers may get the same alert group; only one may open its post.
     async with KEY_LOCKS.setdefault(key, asyncio.Lock()):
         inc = await _incident_for(payload, key)
+    cleared = state == "cleared"
+    if cleared:
+        # It fired and stopped. Still investigated: what happened, and whether
+        # it will again. The resolve may already have come and gone (it found
+        # no post), so this post is marked resolved now and retired after the
+        # run, exactly as a resolve would have done.
+        log.info("%s (%s) already cleared; investigating anyway", key, inc.sha)
+        inc.resolved = True
+        inc.messages.append({"role": "user", "content":
+            "Alertmanager says this alert has ALREADY CLEARED: it fired and stopped "
+            "before this run began. Investigate it anyway, in the past tense: what "
+            "caused it over the window it covers, whether that was expected, and "
+            "whether it will recur. Change nothing live unless something is still wrong."})
     inc.ran_at = time.time()
     await investigate(inc, first=True)
+    if cleared and INCIDENTS.get(key) is inc:
+        INCIDENTS.pop(key, None)          # the next firing opens its own post
+        retire_watched()
 
 
 async def _incident_for(payload: dict, key: str) -> Incident:
